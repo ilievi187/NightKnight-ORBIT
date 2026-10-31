@@ -77,19 +77,21 @@ class WorkerBridgeTests(unittest.TestCase):
         self.assertGreaterEqual(resources["cpu_threads"], 1)
         self.assertIn("gpus", resources)
 
-        agy = inspect_antigravity_runtime()
+        fake_agy_bin = self.root / "antigravity"
+        fake_agy_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        skill_dir = self.root / "skills" / "reverse-engineering-arsenal"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: reverse-engineering-arsenal\n---\n", encoding="utf-8")
+
+        agy = inspect_antigravity_runtime(binary_path=fake_agy_bin, skill_roots=(self.root / "skills",))
         self.assertEqual(agy.runtime_name, "antigravity")
+        self.assertEqual(agy.status, "IDLE")
         self.assertEqual(agy.model_id, "Gemini 4 Argon (Medium)")
         self.assertIn("run_command", agy.tool_allowlist)
         self.assertIn("orbit.plan.deliver", agy.capabilities)
+        self.assertIn("reverse_engineering.arsenal", agy.capabilities)
 
         # Missing binary/service must report OFFLINE, never fake IDLE/LIVE
-        offline_hermes = inspect_hermes_runtime(
-            health_url="http://127.0.0.1:59999/health",
-            binary_path=self.root / "nonexistent-hermes",
-            timeout=0.1,
-        )
-        # Note: if hermes is in PATH on host, shutil.which("hermes") finds it; test explicit LUNA offline probe
         luna_offline = inspect_luna_runtime(tunnel_health_url="http://127.0.0.1:59998/health", timeout=0.1)
         self.assertEqual(luna_offline.status, "OFFLINE")
         self.assertEqual(luna_offline.capabilities, ())

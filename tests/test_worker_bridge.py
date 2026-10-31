@@ -1,486 +1,697 @@
-"""Unit and integration tests for ORBIT Worker Protocol v0.1 & Antigravity/Hermes/OpenCode/LUNA adapters (Issue #13)."""
+"""Comprehensive unit, security, and cross-adapter integration tests for `orbit.workers.v0.1`."""
+
 from __future__ import annotations
 
+import importlib.util
+import io
 import json
+import os
+import secrets
 import sqlite3
+import stat
 import tempfile
+import threading
+import time
 import unittest
+import uuid
 from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException
+import httpx
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
 
+from orbit.app import create_app
+from orbit.config import Settings
 from orbit.worker_bridge import (
-    ANTIGRAVITY_TOOLS,
-    LocalWorkerCoordinator,
-    OrbitWorkerAdapter,
-    TaskResult,
-    WorkerAuthError,
-    WorkerCancelledError,
-    WorkerManifest,
-    WorkerProtocolError,
+    EXECUTABLE_CAPABILITIES,
+    PROTOCOL,
+    AntigravityWorker,
+    ManualClock,
+    WorkerBroker,
+    WorkerClientError,
+    assert_loopback_host,
+    assert_loopback_url,
+    build_antigravity_inventory,
     build_remote_tunnel_spec,
+    create_worker_app,
     inspect_antigravity_runtime,
     inspect_hermes_runtime,
     inspect_host_resources,
     inspect_luna_runtime,
     inspect_opencode_runtime,
-    mask_secret,
-    mount_worker_bridge,
+    read_secret_file,
+    scan_skill_names,
+    write_secret_file,
 )
+from tools import orbit_worker_agent
+
+
+class GrokWireClient:
+    """Reference Grok PR #15 wire client (`orbit.grok_adapter.GrokWorker` compatible)."""
+
+    def __init__(self, client: Any, clock: ManualClock | None = None, worker_id: str = "grok-NightKnightPC") -> None:
+        self.client = client
+        self.clock = clock
+        self.worker_id = worker_id
+        self.token: str | None = None
+        self.capabilities = ["orbit.inventory", "orbit.ping"]
+        self.inventory = {
+            "runtime_name": "grok-build",
+            "adapter_version": "0.1.0",
+            "model_id": "grok-4.7",
+            "model_id_source": "harness_session_identity",
+            "model_endpoint_probed": False,
+            "model_ready": False,
+            "host_id": "NightKnightPC",
+            "executable_capabilities": ["orbit.inventory", "orbit.ping"],
+            "arbitrary_shell_from_dashboard": False,
+            "observed_session_tools": ["read_file", "search_replace"],
+            "observed_session_tools_executable_through_orbit": False,
+            "mcp_servers_connected": ["tasks"],
+            "mcp_tools_invoked": False,
+            "skill_count": 0,
+        }
+
+    def manifest(self, status: str = "IDLE") -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "runtime_name": "grok-build",
+            "host_id": "NightKnightPC",
+            "model_id": "grok-4.7",
+            "model_id_source": "harness_session_identity",
+            "capabilities": list(self.capabilities),
+            "status": status,
+            "version": "0.1.0",
+            "inventory": self.inventory,
+        }
+
+    def _headers(self) -> dict[str, str]:
+        ts = int(self.clock.now().timestamp()) if self.clock else int(time.time())
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "X-Orbit-Nonce": secrets.token_hex(16),
+            "X-Orbit-Timestamp": str(ts),
+        }
+
+    def pair(self, pairing_code: str) -> dict[str, Any]:
+        proto = self.client.get("/api/workers/protocol").json()
+        assert proto["protocol"] == PROTOCOL
+        resp = self.client.post(
+            "/api/workers/pair",
+            json={"protocol": PROTOCOL, "pairing_code": pairing_code, "manifest": self.manifest()},
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        self.token = body["token"]
+        return body
+
+    def heartbeat(self, status: str = "IDLE") -> dict[str, Any]:
+        resp = self.client.post(
+            "/api/workers/heartbeat",
+            headers=self._headers(),
+            json={"manifest": self.manifest(status)},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def handle_once(self) -> dict[str, Any]:
+        beat = self.heartbeat("IDLE")
+        polled = self.client.post("/api/workers/poll", headers=self._headers()).json()
+        lease = polled.get("lease")
+        if not lease:
+            return {"action": "idle", "presence": beat["presence"], "executed_shell": False}
+        task_id = lease["task_id"]
+        lease_id = lease["lease_id"]
+        task_type = lease["offer"]["type"]
+        self.client.post(
+            f"/api/workers/tasks/{task_id}/progress",
+            headers=self._headers(),
+            json={
+                "lease_id": lease_id,
+                "event_id": uuid.uuid4().hex,
+                "status": "accepted",
+                "progress": 0.2,
+                "message": "accepted",
+            },
+        )
+        if task_type == "orbit.ping":
+            msg = lease["offer"]["payload"].get("message", "")
+            output = {"pong": msg, "executed_shell": False}
+        elif task_type == "orbit.inventory":
+            output = {"inventory": self.inventory, "executed_shell": False}
+        else:
+            self.client.post(
+                f"/api/workers/tasks/{task_id}/result",
+                headers=self._headers(),
+                json={
+                    "lease_id": lease_id,
+                    "status": "rejected",
+                    "result": {"reason": "unsupported_task", "executed_shell": False},
+                    "log_excerpt": "not executed",
+                },
+            )
+            return {"action": "rejected", "task_id": task_id, "executed_shell": False}
+        self.client.post(
+            f"/api/workers/tasks/{task_id}/progress",
+            headers=self._headers(),
+            json={
+                "lease_id": lease_id,
+                "event_id": uuid.uuid4().hex,
+                "status": "running",
+                "progress": 1.0,
+                "message": "finished",
+            },
+        )
+        self.client.post(
+            f"/api/workers/tasks/{task_id}/result",
+            headers=self._headers(),
+            json={
+                "lease_id": lease_id,
+                "status": "completed",
+                "result": output,
+                "log_excerpt": "ok",
+            },
+        )
+        self.heartbeat("IDLE")
+        return {"action": "completed", "task_id": task_id, "result": output, "executed_shell": False}
 
 
 class WorkerBridgeTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="orbit-worker-test-")
-        self.root = Path(self.tmp.name)
-        self.workspace = self.root / "workspace"
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.root / "orbit.sqlite3"
-        self.coord = LocalWorkerCoordinator(
-            self.db_path,
-            self.workspace,
-            heartbeat_ttl=20.0,
-            lease_ttl=60.0,
-            pairing_ttl=300.0,
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="orbit_worker_test_")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.clock = ManualClock()
+        self.database = self.base / "broker.sqlite3"
+        self.app = create_worker_app(
+            self.database,
+            clock=self.clock,
+            offline_after=20,
+            lease_ttl=30,
+            token_ttl=120,
+            pairing_ttl=60,
+            failure_limit=3,
+            failure_window=60,
+            timestamp_skew=60,
         )
-        self.app = FastAPI()
-        mount_worker_bridge(self.app, self.coord)
-        self.client = TestClient(self.app)
+        self.broker: WorkerBroker = self.app.state.worker_broker
+        self.op_token = self.broker.operator_token
+        self.op_headers = {"Authorization": f"Bearer {self.op_token}"}
+        self.client = TestClient(self.app, base_url="http://127.0.0.1")
+        self.addCleanup(self.client.close)
+        self.addCleanup(self.broker.close)
 
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def _make_manifest(
-        self,
-        worker_id: str = "antigravity-test",
-        runtime_name: str = "antigravity",
-        status: str = "IDLE",
-        model_id: str | None = "Gemini 4 Argon (Medium)",
-    ) -> WorkerManifest:
-        return WorkerManifest(
-            worker_id=worker_id,
-            runtime_name=runtime_name,
+        self.fake_ag_bin = self.base / "antigravity"
+        self.fake_ag_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.inventory = build_antigravity_inventory(
+            skill_roots=[],
             host_id="NightKnightPC",
-            model_id=model_id,
-            capabilities=("orbit.plan.deliver", "workspace.inspect", "workspace.read", "workspace.write_scoped"),
-            tool_allowlist=ANTIGRAVITY_TOOLS,
-            skills=("reverse-engineering-arsenal", "agy-customizations"),
-            status=status,
-            version="2.0-agy",
+            binary_path=self.fake_ag_bin,
         )
 
-    def test_runtime_and_hardware_discovery_truthful(self):
-        resources = inspect_host_resources()
-        self.assertTrue(resources["hostname"])
-        self.assertGreaterEqual(resources["cpu_threads"], 1)
-        self.assertIn("gpus", resources)
+    def issue_code(self) -> str:
+        resp = self.client.post("/api/workers/pairing", headers=self.op_headers)
+        self.assertEqual(resp.status_code, 201, resp.text)
+        return resp.json()["pairing_code"]
 
-        fake_agy_bin = self.root / "antigravity"
-        fake_agy_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-        skill_dir = self.root / "skills" / "reverse-engineering-arsenal"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("---\nname: reverse-engineering-arsenal\n---\n", encoding="utf-8")
-
-        agy = inspect_antigravity_runtime(binary_path=fake_agy_bin, skill_roots=(self.root / "skills",))
-        self.assertEqual(agy.runtime_name, "antigravity")
-        self.assertEqual(agy.status, "IDLE")
-        self.assertEqual(agy.model_id, "Gemini 4 Argon (Medium)")
-        self.assertIn("run_command", agy.tool_allowlist)
-        self.assertIn("orbit.plan.deliver", agy.capabilities)
-        self.assertIn("reverse_engineering.arsenal", agy.capabilities)
-
-        # Missing binary/service must report OFFLINE, never fake IDLE/LIVE
-        luna_offline = inspect_luna_runtime(tunnel_health_url="http://127.0.0.1:59998/health", timeout=0.1)
-        self.assertEqual(luna_offline.status, "OFFLINE")
-        self.assertEqual(luna_offline.capabilities, ())
-        self.assertIsNone(luna_offline.model_id)
-
-        # OpenCode must be identified as worker runtime, not an LLM model
-        oc = inspect_opencode_runtime(timeout=0.2)
-        self.assertEqual(oc.runtime_name, "opencode")
-        self.assertIsNone(oc.model_id)
-
-    def test_pairing_invalid_expired_revoked_and_replay(self):
-        manifest = self._make_manifest()
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=manifest,
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
+    def make_ag_worker(self, worker_id: str = "antigravity-NightKnightPC", **kwargs: Any) -> AntigravityWorker:
+        return AntigravityWorker(
+            "http://127.0.0.1",
+            client=self.client,
+            workspace_root=self.base,
+            inventory=kwargs.pop("inventory", self.inventory),
+            worker_id=worker_id,
+            clock=self.clock,
+            **kwargs,
         )
 
-        # 1. Invalid pairing credential rejected
-        with self.assertRaises(WorkerAuthError):
-            adapter.pair_and_register("orb_pair_invalid_secret_code")
+    def test_01_discovery_separates_observed_tools_and_runtimes_from_connected_workers(self) -> None:
+        skill_root = self.base / "skills"
+        secret_body = "TOP-SECRET-SKILL-BODY-DO-NOT-READ"
+        (skill_root / "reverse-elf").mkdir(parents=True)
+        (skill_root / "reverse-elf" / "SKILL.md").write_text(secret_body, encoding="utf-8")
+        names = scan_skill_names([skill_root])
+        self.assertEqual(names, ["reverse-elf"])
+        self.assertNotIn(secret_body, json.dumps(names))
 
-        # 2. Expired pairing credential rejected
-        expired = self.coord.create_pairing_code(ttl=10.0, now=1000.0)
-        with self.assertRaises(WorkerAuthError):
-            self.coord.register_worker(expired["pairing_code"], manifest, now=1020.0)
+        ag = inspect_antigravity_runtime(binary_path=self.fake_ag_bin, skill_roots=[skill_root])
+        self.assertTrue(ag.discovered)
+        self.assertFalse(ag.connected)
+        self.assertFalse(ag.authorized_to_execute)
+        self.assertEqual(ag.model_id, "Gemini 4 Argon (Medium)")
+        self.assertEqual(ag.capabilities, list(EXECUTABLE_CAPABILITIES))
+        self.assertFalse(ag.inventory["observed_session_tools_executable_through_orbit"])
+        self.assertFalse(ag.inventory["skills_executable_through_orbit"])
+        self.assertFalse(ag.inventory["arbitrary_shell_from_dashboard"])
+        self.assertFalse(ag.inventory["model_ready"])
+        self.assertIn("run_command", ag.inventory["observed_session_tools"])
+        self.assertNotIn("run_command", ag.capabilities)
 
-        # 3. Revoked pairing credential rejected
-        revoked_p = self.coord.create_pairing_code()
-        self.assertTrue(self.coord.revoke_pairing(revoked_p["pairing_id"]))
-        with self.assertRaises(WorkerAuthError):
-            adapter.pair_and_register(revoked_p["pairing_code"])
+        # Before pairing, discovery endpoint reports all runtimes as unconnected
+        disc_before = self.client.get("/api/workers/discovery").json()
+        for rt_name in ("antigravity", "hermes", "opencode", "luna"):
+            self.assertFalse(disc_before["runtimes"][rt_name]["connected"])
+            self.assertFalse(disc_before["runtimes"][rt_name]["authorized_to_execute"])
+            self.assertEqual(disc_before["runtimes"][rt_name]["executable_capabilities"], [])
 
-        # 4. Valid pairing succeeds once, then replay of the same pairing code is blocked
-        valid = self.coord.create_pairing_code(allowed_runtime="antigravity")
-        reg = adapter.pair_and_register(valid["pairing_code"], nonce="unique-nonce-001")
-        self.assertEqual(reg["worker_id"], "antigravity-test")
-        self.assertTrue(adapter.worker_token)
-        self.assertNotIn(adapter.worker_token, adapter.token_hint)
-
-        with self.assertRaises(WorkerAuthError):
-            adapter.pair_and_register(valid["pairing_code"], nonce="unique-nonce-002")
-
-        # 5. Replayed nonce with another valid pairing code is blocked
-        valid2 = self.coord.create_pairing_code(allowed_runtime="antigravity")
-        with self.assertRaises(WorkerAuthError):
-            adapter.pair_and_register(valid2["pairing_code"], nonce="unique-nonce-001")
-
-        # 6. Verify SQLite never stores plaintext pairing code or worker token
-        raw_db_bytes = self.db_path.read_bytes()
-        self.assertNotIn(valid["pairing_code"].encode("utf-8"), raw_db_bytes)
-        self.assertNotIn(adapter.worker_token.encode("utf-8"), raw_db_bytes)
-
-        # 7. Revoking worker token immediately blocks heartbeat and polling
-        self.coord.revoke_worker_tokens("antigravity-test")
-        with self.assertRaises(WorkerAuthError):
-            adapter.send_heartbeat()
-        with self.assertRaises(WorkerAuthError):
-            adapter.poll_offers()
-
-        # 8. Offline runtime manifest cannot register as active worker
-        offline_manifest = self._make_manifest(worker_id="offline-w", status="OFFLINE")
-        valid3 = self.coord.create_pairing_code()
-        offline_adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=offline_manifest,
-            client=self.client,  # type: ignore[arg-type]
+        # Pair Antigravity and send heartbeat -> only antigravity becomes connected & authorized
+        worker = self.make_ag_worker()
+        worker.pair(self.issue_code())
+        worker.heartbeat("IDLE")
+        disc_after = self.client.get("/api/workers/discovery").json()
+        self.assertTrue(disc_after["runtimes"]["antigravity"]["connected"])
+        self.assertTrue(disc_after["runtimes"]["antigravity"]["authorized_to_execute"])
+        self.assertEqual(
+            disc_after["runtimes"]["antigravity"]["executable_capabilities"],
+            list(EXECUTABLE_CAPABILITIES),
         )
-        with self.assertRaises(WorkerProtocolError):
-            offline_adapter.pair_and_register(valid3["pairing_code"])
+        # Sibling runtimes remain unconnected until their own adapters pair & heartbeat
+        self.assertFalse(disc_after["runtimes"]["hermes"]["connected"])
+        self.assertFalse(disc_after["runtimes"]["opencode"]["connected"])
+        self.assertFalse(disc_after["runtimes"]["luna"]["connected"])
 
-    def test_heartbeat_liveness_and_lost_worker_requeue(self):
-        p1 = self.coord.create_pairing_code(now=100.0)
-        m1 = self._make_manifest(worker_id="worker-alpha")
-        self.coord.register_worker(p1["pairing_code"], m1, now=100.0)
-        self.coord.heartbeat("worker-alpha", status="IDLE", now=105.0)
-
-        task = self.coord.enqueue_task(
-            "Deliver alpha artifact",
-            {"op": "deliver", "path": "alpha.txt", "must_contain": ["ALPHA_OK"]},
-            now=106.0,
+    def test_02_operator_endpoints_enforce_scoped_auth_and_reject_worker_or_forwarded_calls(self) -> None:
+        # 1. Unauthenticated requests (without Origin, simulating curl/local untrusted process) -> 401
+        self.assertEqual(self.client.post("/api/workers/pairing").status_code, 401)
+        self.assertEqual(
+            self.client.post("/api/workers/tasks", json={"type": "orbit.ping"}).status_code,
+            401,
         )
-        claimed = self.coord.claim_task(task["task_id"], "worker-alpha", now=107.0)
-        self.assertEqual(claimed["lease"]["status"], "ACTIVE")
-        self.assertEqual(self.coord.get_worker("worker-alpha", now=108.0)["status"], "BUSY")
-
-        # Advance time past heartbeat_ttl (20s): worker-alpha becomes OFFLINE and task returns to PENDING
-        worker_after = self.coord.get_worker("worker-alpha", now=140.0)
-        self.assertEqual(worker_after["status"], "OFFLINE")
-        requeued = self.coord.get_task(task["task_id"])
-        self.assertEqual(requeued["status"], "PENDING")
-        self.assertIsNone(requeued["worker_id"])
-
-        # A second live worker can now claim and complete the requeued task
-        p2 = self.coord.create_pairing_code(now=141.0)
-        m2 = self._make_manifest(worker_id="worker-beta", runtime_name="hermes", model_id=None)
-        self.coord.register_worker(p2["pairing_code"], m2, now=141.0)
-        claimed2 = self.coord.claim_task(task["task_id"], "worker-beta", now=142.0)
-        self.assertEqual(claimed2["lease"]["worker_id"], "worker-beta")
-
-    def test_duplicate_task_lease_prevention(self):
-        p1 = self.coord.create_pairing_code()
-        p2 = self.coord.create_pairing_code()
-        w1 = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="w-one"),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
+        self.assertEqual(
+            self.client.post("/api/workers/revoke", json={"worker_id": "any"}).status_code,
+            401,
         )
-        w2 = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="w-two", runtime_name="opencode", model_id=None),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
-        )
-        w1.pair_and_register(p1["pairing_code"])
-        w2.pair_and_register(p2["pairing_code"])
-
-        task = self.coord.enqueue_task(
-            "Single lease task",
-            {"op": "deliver", "path": "single.txt", "must_contain": ["LEASE_OK"]},
+        self.assertEqual(
+            self.client.post("/api/workers/tasks/t1/cancel").status_code,
+            401,
         )
 
-        # Worker 1 claims task
-        claim1 = w1.claim(task["task_id"])
-        lease_id = claim1["lease"]["lease_id"]
-
-        # Idempotent re-claim by Worker 1 returns the same lease
-        claim1_again = w1.claim(task["task_id"])
-        self.assertEqual(claim1_again["lease"]["lease_id"], lease_id)
-
-        # Worker 2 attempting to claim the same task is rejected (409)
-        with self.assertRaises(WorkerProtocolError):
-            w2.claim(task["task_id"])
-
-        # Worker 2 also does not see the leased task in poll_offers()
-        self.assertEqual(w2.poll_offers(), [])
-
-    def test_end_to_end_task_delivery_and_lying_worker_detection(self):
-        p = self.coord.create_pairing_code()
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="agy-e2e"),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
+        # 2. Pair a worker and verify worker bearer token is forbidden (403) on operator routes
+        worker = self.make_ag_worker()
+        worker.pair(self.issue_code())
+        worker_headers = {"Authorization": f"Bearer {worker.token}"}
+        self.assertEqual(
+            self.client.post("/api/workers/pairing", headers=worker_headers).status_code,
+            403,
         )
-        adapter.pair_and_register(p["pairing_code"])
-
-        # 1. Honest worker delivers artifact and server verifies SHA-256 + content
-        t1 = self.coord.enqueue_task(
-            "Create verified proof",
-            {"op": "deliver", "path": "docs/proof.md", "must_contain": ["PROOF_TOKEN_42"]},
-            grant={"root": str(self.workspace), "denied_paths": []},
+        self.assertEqual(
+            self.client.post(
+                "/api/workers/tasks",
+                headers=worker_headers,
+                json={"type": "orbit.ping"},
+            ).status_code,
+            403,
         )
-        res1 = adapter.run_once()
-        self.assertIsNotNone(res1)
-        self.assertEqual(res1["status"], "VERIFIED")
-        self.assertTrue((self.workspace / "docs" / "proof.md").is_file())
-        self.assertIn("PROOF_TOKEN_42", (self.workspace / "docs" / "proof.md").read_text(encoding="utf-8"))
-
-        # 2. Lying worker submits 'SUBMITTED' without creating the required file -> coordinator marks FAILED
-        t2 = self.coord.enqueue_task(
-            "Unverified claim test",
-            {"op": "deliver", "path": "docs/missing.md", "must_contain": ["MUST_EXIST"]},
-            grant={"root": str(self.workspace), "denied_paths": []},
-        )
-        claimed2 = adapter.claim(t2["task_id"])
-        fake_result = TaskResult(
-            task_id=t2["task_id"],
-            lease_id=claimed2["lease"]["lease_id"],
-            worker_id="agy-e2e",
-            status="SUBMITTED",
-            summary="I promise I wrote docs/missing.md!",
-            artifacts=[{"path": "docs/missing.md"}],
-        )
-        reported2 = adapter.submit_result(fake_result)
-        self.assertEqual(reported2["status"], "FAILED")
-        self.assertFalse(reported2["result"]["verified"])
-
-    def test_deterministic_cancellation_mid_task(self):
-        p = self.coord.create_pairing_code()
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="agy-cancel"),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
-        )
-        adapter.pair_and_register(p["pairing_code"])
-
-        task = self.coord.enqueue_task(
-            "Task to cancel mid-flight",
-            {"op": "deliver", "path": "cancelled.txt", "must_contain": ["NEVER_WRITTEN"]},
-            grant={"root": str(self.workspace), "denied_paths": []},
+        self.assertEqual(
+            self.client.post(
+                "/api/workers/revoke",
+                headers=worker_headers,
+                json={"worker_id": worker.worker_id},
+            ).status_code,
+            403,
         )
 
-        def cancel_during_step():
-            self.coord.cancel_task(task["task_id"], reason="User requested cancellation")
-            adapter.send_heartbeat(status="BUSY")
+        # 3. Verify operator bearer token is forbidden (403) on worker routes
+        op_worker_headers = {
+            "Authorization": f"Bearer {self.op_token}",
+            "X-Orbit-Nonce": "nonce-op-12345",
+            "X-Orbit-Timestamp": str(int(self.clock.now().timestamp())),
+        }
+        self.assertEqual(
+            self.client.post("/api/workers/poll", headers=op_worker_headers).status_code,
+            403,
+        )
 
-        outcome = adapter.run_once(on_step_hook=cancel_during_step)
-        self.assertIsNotNone(outcome)
-        self.assertEqual(outcome["status"], "CANCELLED")
-        self.assertFalse((self.workspace / "cancelled.txt").exists())
-
-        # Late result submission after cancellation must be rejected (409)
-        with self.assertRaises(WorkerCancelledError):
-            adapter.submit_result(
-                TaskResult(
-                    task_id=task["task_id"],
-                    lease_id="",
-                    worker_id="agy-cancel",
-                    status="SUBMITTED",
-                    summary="late result",
-                )
+        # 4. Verify forwarded headers (SSH/proxy forwarding) are rejected (403) on operator routes
+        for hdr, val in (
+            ("X-Forwarded-For", "100.98.90.67"),
+            ("Forwarded", "for=100.98.90.67"),
+            ("X-Real-IP", "100.98.90.67"),
+        ):
+            self.assertEqual(
+                self.client.post(
+                    "/api/workers/pairing",
+                    headers={**self.op_headers, hdr: val},
+                ).status_code,
+                403,
             )
 
-    def test_unavailable_model_and_permission_denial_do_not_halt_unrelated_tasks(self):
-        p = self.coord.create_pairing_code()
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="agy-policy"),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
-            model_available_check=lambda m: m == "Gemini 4 Argon (Medium)",
+        # 5. Cross-origin browser mutation denied (403)
+        self.assertEqual(
+            self.client.post(
+                "/api/workers/pairing",
+                headers={**self.op_headers, "Origin": "https://evil.example"},
+            ).status_code,
+            403,
         )
-        adapter.pair_and_register(p["pairing_code"])
 
-        grant = {"root": str(self.workspace), "denied_paths": ["restricted/"]}
-
-        # Task 1: Requires offline model -> fails gracefully with MODEL_UNAVAILABLE
-        t_model = self.coord.enqueue_task(
-            "Needs offline 70B model",
-            {"op": "deliver", "path": "model_out.txt", "require_model": "offline-heretic-70b"},
-            grant=grant,
+        # 6. Revoked operator token is rejected (401)
+        temp_op = self.broker.issue_operator_token("temp-admin")
+        self.assertEqual(
+            self.client.post(
+                "/api/workers/pairing",
+                headers={"X-Orbit-Operator-Token": temp_op},
+            ).status_code,
+            201,
         )
-        r_model = adapter.run_once()
-        self.assertEqual(r_model["status"], "FAILED")
-        self.assertIn("MODEL_UNAVAILABLE", r_model["result"]["summary"])
-
-        # Task 2: Arbitrary shell execution attempt -> BLOCKED
-        t_shell = self.coord.enqueue_task(
-            "Untrusted shell op",
-            {"op": "shell", "command": "cat /etc/shadow"},
-            grant=grant,
+        self.broker.revoke_operator_token(temp_op)
+        self.assertEqual(
+            self.client.post(
+                "/api/workers/pairing",
+                headers={"X-Orbit-Operator-Token": temp_op},
+            ).status_code,
+            401,
         )
-        r_shell = adapter.run_once()
-        self.assertEqual(r_shell["status"], "BLOCKED")
-        self.assertIn("GRANT DENIED", r_shell["result"]["summary"])
 
-        # Task 3: Denied path in grant -> BLOCKED
-        t_denied = self.coord.enqueue_task(
-            "Write to denied folder",
-            {"op": "deliver", "path": "restricted/secret.txt", "must_contain": ["NOPE"]},
-            grant=grant,
-        )
-        r_denied = adapter.run_once()
-        self.assertEqual(r_denied["status"], "BLOCKED")
+    def test_03_pairing_and_worker_auth_lifecycle_and_hash_only_storage(self) -> None:
+        code = self.issue_code()
+        worker = self.make_ag_worker()
 
-        # Task 4: Sensitive filename (.env) -> BLOCKED
-        t_env = self.coord.enqueue_task(
-            "Write .env file",
-            {"op": "deliver", "path": ".env", "must_contain": ["SECRET=1"]},
-            grant=grant,
-        )
-        r_env = adapter.run_once()
-        self.assertEqual(r_env["status"], "BLOCKED")
-
-        # Task 5: Unrelated valid task in the same mission -> SUCCEEDS and is VERIFIED!
-        t_ok = self.coord.enqueue_task(
-            "Valid sibling task",
-            {"op": "deliver", "path": "allowed/report.md", "must_contain": ["MISSION_CONTINUES"]},
-            grant=grant,
-        )
-        r_ok = adapter.run_once()
-        self.assertEqual(r_ok["status"], "VERIFIED")
-        self.assertTrue((self.workspace / "allowed" / "report.md").is_file())
-
-    def test_persistence_across_coordinator_restart(self):
-        p = self.coord.create_pairing_code()
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="agy-persist"),
-            client=self.client,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
-        )
-        adapter.pair_and_register(p["pairing_code"])
-        t1 = self.coord.enqueue_task(
-            "Persisted task 1",
-            {"op": "deliver", "path": "persisted.txt", "must_contain": ["SURVIVED_RESTART"]},
-        )
-        adapter.run_once()
-
-        # Simulate coordinator restart on the same SQLite database
-        restarted_coord = LocalWorkerCoordinator(self.db_path, self.workspace)
-        restarted_app = FastAPI()
-        mount_worker_bridge(restarted_app, restarted_coord)
-        restarted_client = TestClient(restarted_app)
-
-        # Existing worker token and verified task state remain intact after restart
-        adapter._client = restarted_client  # type: ignore[assignment]
-        beat = adapter.send_heartbeat(status="IDLE")
-        self.assertEqual(beat["worker"]["worker_id"], "agy-persist")
-        saved_task = restarted_coord.get_task(t1["task_id"])
-        self.assertEqual(saved_task["status"], "VERIFIED")
-
-    def test_issue_12_mission_api_wire_compatibility(self):
-        """Verify OrbitWorkerAdapter speaks Issue #12's exact /api/workers/v0.1 wire format."""
-        app12 = FastAPI()
-        router12 = APIRouter()
-        state: dict = {
-            "pairing_code": "A1B2C3-D4E5F6-112233",
-            "worker_token": "tok_issue12_secret_token_1234567890",
-            "task": {
-                "task_id": "task-12-demo",
-                "title": "Deliver orbit-demo/report.md",
-                "status": "ASSIGNED",
-                "attempt": 1,
-                "mission_id": "mission-12",
-                "spec": {"op": "deliver", "path": "orbit-demo/report.md", "must_contain": ["VERIFIED"]},
+        # Protocol mismatch does not consume pairing code
+        mismatch = self.client.post(
+            "/api/workers/pair",
+            json={
+                "protocol": "orbit.workers.v9",
+                "pairing_code": code,
+                "manifest": worker.inventory | {"worker_id": "ag-1", "capabilities": ["orbit.ping"], "status": "IDLE", "version": "0.1.0"},
             },
-            "reported": None,
+        )
+        self.assertEqual(mismatch.status_code, 409)
+
+        # Valid pair succeeds and hides token from snapshot/HTML
+        worker.pair(code)
+        raw_token = worker.token
+        self.assertIsNotNone(raw_token)
+
+        snap_text = json.dumps(self.client.get("/api/workers").json()) + self.client.get("/").text
+        self.assertNotIn(raw_token, snap_text)
+        self.assertNotIn(code, snap_text)
+
+        # Check SQLite stores only hashes, never raw secrets
+        with sqlite3.connect(self.database) as conn:
+            dump = "\n".join(conn.iterdump())
+        self.assertNotIn(raw_token, dump)
+        self.assertNotIn(code, dump)
+        self.assertNotIn(self.op_token, dump)
+
+        # Reusing single-use pairing code fails with 401
+        with self.assertRaises(WorkerClientError) as ctx:
+            self.make_ag_worker(worker_id="ag-2").pair(code)
+        self.assertEqual(ctx.exception.status, 401)
+
+        # Expired pairing code fails with 401
+        exp_code = self.issue_code()
+        self.clock.advance(61)
+        with self.assertRaises(WorkerClientError) as ctx:
+            self.make_ag_worker(worker_id="ag-late").pair(exp_code)
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_04_concurrent_nonce_replay_is_atomic_and_never_500s(self) -> None:
+        worker = self.make_ag_worker()
+        worker.pair(self.issue_code())
+        shared_nonce = "concurrent-nonce-0001"
+        ts = str(int(self.clock.now().timestamp()))
+        headers = {
+            "Authorization": f"Bearer {worker.token}",
+            "X-Orbit-Nonce": shared_nonce,
+            "X-Orbit-Timestamp": ts,
         }
 
-        @router12.post("/api/workers/v0.1/register", status_code=201)
-        def reg12(payload: dict):
-            if payload.get("pairing_code") != state["pairing_code"]:
-                raise HTTPException(403, "unknown pairing code")
-            if payload.get("kind") not in ("mock", "hermes", "opencode", "custom"):
-                raise HTTPException(403, "invalid kind")
-            return {
-                "worker_id": "w12-id",
-                "worker_token": state["worker_token"],
-                "heartbeat_ttl": 20.0,
-                "capabilities": payload.get("capabilities") or [],
-                "status": "OFFLINE",
-            }
+        barrier = threading.Barrier(8)
+        statuses: list[int] = []
+        lock = threading.Lock()
 
-        @router12.post("/api/workers/v0.1/heartbeat")
-        def beat12(payload: dict):
-            if payload.get("worker_token") != state["worker_token"]:
-                raise HTTPException(403, "invalid token")
-            return {"worker_id": "w12-id", "status": "IDLE", "heartbeat_ttl": 20.0, "assigned_task": state["task"]}
+        def poll_worker() -> None:
+            barrier.wait()
+            resp = self.client.post("/api/workers/poll", headers=headers)
+            with lock:
+                statuses.append(resp.status_code)
 
-        @router12.post("/api/workers/v0.1/poll")
-        def poll12(payload: dict):
-            if payload.get("worker_token") != state["worker_token"]:
-                raise HTTPException(403, "invalid token")
-            return {"assigned_task": state["task"]}
+        threads = [threading.Thread(target=poll_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-        @router12.post("/api/workers/v0.1/claim")
-        def claim12(payload: dict):
-            if payload.get("worker_token") != state["worker_token"]:
-                raise HTTPException(403, "invalid token")
-            state["task"]["status"] = "RUNNING"
-            return {"claimed": True, "task": state["task"]}
+        self.assertEqual(statuses.count(200), 1, f"Expected exactly one 200, got {statuses}")
+        self.assertEqual(statuses.count(409), 7, f"Expected seven 409s, got {statuses}")
+        self.assertNotIn(500, statuses)
 
-        @router12.post("/api/workers/v0.1/report")
-        def report12(payload: dict):
-            if payload.get("worker_token") != state["worker_token"]:
-                raise HTTPException(403, "invalid token")
-            if not isinstance(payload.get("artifacts"), list) or not all(isinstance(x, str) for x in payload["artifacts"]):
-                raise HTTPException(422, "artifacts must be list[str]")
-            state["task"]["status"] = "SUBMITTED"
-            state["reported"] = payload
-            return {"reported": True, "task": state["task"]}
+    def test_05_cross_adapter_antigravity_and_grok_on_unified_broker(self) -> None:
+        ag_worker = self.make_ag_worker(worker_id="antigravity-NightKnightPC")
+        ag_worker.pair(self.issue_code())
+        ag_worker.heartbeat("IDLE")
 
-        app12.include_router(router12)
-        client12 = TestClient(app12)
+        grok_worker = GrokWireClient(self.client, clock=self.clock, worker_id="grok-NightKnightPC")
+        grok_worker.pair(self.issue_code())
+        grok_worker.heartbeat("IDLE")
 
-        adapter = OrbitWorkerAdapter(
-            base_url="http://testserver",
-            manifest=self._make_manifest(worker_id="Antigravity-NK", runtime_name="antigravity"),
-            client=client12,  # type: ignore[arg-type]
-            default_workspace=self.workspace,
+        # Also verify PR #15's GrokWorker class directly if present on the host
+        grok_orbit_dir = Path("/home/nightknight/Projects/NightKnight-ORBIT-grok-worker/orbit")
+        if (grok_orbit_dir / "grok_adapter.py").is_file():
+            import orbit
+
+            orbit.__path__.append(str(grok_orbit_dir))
+            try:
+                from orbit.grok_adapter import GrokWorker as PR15GrokWorker  # type: ignore
+
+                real_app = create_worker_app(self.base / "real_clock_broker.sqlite3")
+                with TestClient(real_app, base_url="http://127.0.0.1") as rc:
+                    rc_op = {"Authorization": f"Bearer {real_app.state.worker_broker.operator_token}"}
+                    rc_code = rc.post("/api/workers/pairing", headers=rc_op).json()["pairing_code"]
+                    pr15_grok = PR15GrokWorker(
+                        "http://127.0.0.1",
+                        client=rc,
+                        inventory=grok_worker.inventory,
+                        worker_id="grok-pr15-live",
+                    )
+                    pr15_grok.pair(rc_code, worker_id="grok-pr15-live")
+                    rc.post(
+                        "/api/workers/tasks",
+                        headers=rc_op,
+                        json={"type": "orbit.ping", "payload": {"message": "from-pr15-grok"}},
+                    )
+                    pr15_out = pr15_grok.handle_once()
+                    self.assertEqual(pr15_out["action"], "completed")
+                    self.assertEqual(pr15_out["result"]["pong"], "from-pr15-grok")
+            finally:
+                if str(grok_orbit_dir) in orbit.__path__:
+                    orbit.__path__.remove(str(grok_orbit_dir))
+
+        workers = {w["worker_id"]: w for w in self.client.get("/api/workers").json()["workers"]}
+        self.assertEqual(workers["antigravity-NightKnightPC"]["presence"], "LIVE")
+        self.assertEqual(workers["grok-NightKnightPC"]["presence"], "LIVE")
+
+        # Enqueue a task requiring `orbit.smoke_check` (supported by Antigravity, not Grok)
+        # and a task requiring `orbit.ping` (supported by both)
+        smoke_resp = self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={
+                "type": "orbit.smoke_check",
+                "payload": {"output_path": "docs/CROSS-PROOF.md"},
+                "grant": "local",
+                "task_id": "task-smoke-1",
+            },
         )
-        reg = adapter.pair_and_register(state["pairing_code"])
-        self.assertEqual(reg["worker_id"], "w12-id")
-        out = adapter.run_once()
-        self.assertTrue(out["reported"])
-        self.assertEqual(state["reported"]["artifacts"], ["orbit-demo/report.md"])
-        self.assertTrue((self.workspace / "orbit-demo" / "report.md").is_file())
+        self.assertEqual(smoke_resp.status_code, 201)
 
-    def test_remote_ssh_tailscale_tunnel_spec(self):
-        spec = build_remote_tunnel_spec("ubuntu-hermes", tailscale_ip="100.98.90.67")
-        self.assertFalse(spec["public_exposure"])
-        self.assertFalse(spec["root_required"])
-        self.assertIn("127.0.0.1:18765:127.0.0.1:8765", spec["ssh_command"])
-        self.assertNotIn("0.0.0.0", spec["ssh_command"])
+        ping_resp = self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={
+                "type": "orbit.ping",
+                "payload": {"message": "cross-adapter-pong"},
+                "grant": "local",
+                "task_id": "task-ping-1",
+            },
+        )
+        self.assertEqual(ping_resp.status_code, 201)
+
+        # Grok polls first: skips `orbit.smoke_check` (records capability_denied) and claims `orbit.ping`!
+        grok_out = grok_worker.handle_once()
+        self.assertEqual(grok_out["action"], "completed")
+        self.assertEqual(grok_out["task_id"], "task-ping-1")
+        self.assertEqual(grok_out["result"]["pong"], "cross-adapter-pong")
+
+        # Antigravity polls next: claims and completes `orbit.smoke_check`!
+        ag_out = ag_worker.handle_once()
+        self.assertEqual(ag_out["action"], "completed")
+        self.assertEqual(ag_out["task_id"], "task-smoke-1")
+        self.assertEqual(ag_out["result"]["status"], "VERIFIED")
+        self.assertTrue((self.base / "docs" / "CROSS-PROOF.md").is_file())
+
+    def test_06_cancel_heartbeat_loss_and_shell_or_traversal_rejection(self) -> None:
+        worker = self.make_ag_worker(capabilities=["orbit.ping", "orbit.smoke_check", "shell"])
+        worker.pair(self.issue_code())
+        worker.heartbeat("IDLE")
+
+        # 1. Cancel mid-flight prevents completion
+        self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={"type": "orbit.ping", "payload": {"message": "cancel-me"}, "task_id": "t-cancel"},
+        )
+        polled = worker.poll()
+        lease = polled["lease"]
+        self.client.post("/api/workers/tasks/t-cancel/cancel", headers=self.op_headers)
+        with self.assertRaises(WorkerClientError) as ctx:
+            worker.result("t-cancel", lease["lease_id"], "completed", {"pong": "late"}, "late")
+        self.assertEqual(ctx.exception.status, 409)
+        out_cancel = worker.handle_once()
+        self.assertEqual(out_cancel["action"], "cancelled")
+
+        # 2. Shell task is rejected without executing any shell
+        marker = self.base / "pwned"
+        self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={"type": "shell", "payload": {"command": f"touch {marker}"}, "task_id": "t-shell"},
+        )
+        out_shell = worker.handle_once()
+        self.assertEqual(out_shell["action"], "rejected")
+        self.assertFalse(out_shell["executed_shell"])
+        self.assertFalse(marker.exists())
+
+        # 3. Path traversal in `orbit.smoke_check` is rejected
+        self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={
+                "type": "orbit.smoke_check",
+                "payload": {"output_path": "../escape.md"},
+                "task_id": "t-escape",
+            },
+        )
+        out_escape = worker.handle_once()
+        self.assertEqual(out_escape["action"], "rejected")
+
+        # 4. Lost heartbeat releases lease to backup worker
+        self.client.post(
+            "/api/workers/tasks",
+            headers=self.op_headers,
+            json={"type": "orbit.ping", "payload": {"message": "failover"}, "task_id": "t-failover"},
+        )
+        worker.heartbeat("IDLE")
+        held = worker.poll()["lease"]
+        self.assertEqual(held["task_id"], "t-failover")
+        self.clock.advance(25)
+
+        backup = self.make_ag_worker(worker_id="antigravity-backup")
+        backup.pair(self.issue_code())
+        backup.heartbeat("IDLE")
+        recovered = backup.handle_once()
+        self.assertEqual(recovered["action"], "completed")
+        self.assertEqual(recovered["task_id"], "t-failover")
+
+    def test_07_cli_rejects_pairing_in_argv_and_enforces_0600_secret_files(self) -> None:
+        # 1. Passing --pairing in argv is strictly rejected
+        for bad_args in (["pair", "--pairing", "secret123"], ["pair", "--pairing=secret123"]):
+            with self.assertRaises(SystemExit) as ctx:
+                orbit_worker_agent.main(bad_args)
+            self.assertIn("forbidden", str(ctx.exception))
+
+        # 2. write_secret_file creates 0600 file; read_secret_file rejects 0644 file
+        secret_file = self.base / "pairing.code"
+        write_secret_file(secret_file, "code-12345678\n")
+        self.assertEqual(stat.S_IMODE(secret_file.stat().st_mode), 0o600)
+        self.assertEqual(read_secret_file(secret_file), "code-12345678")
+
+        os.chmod(secret_file, 0o644)
+        with self.assertRaises(PermissionError):
+            read_secret_file(secret_file)
+        with self.assertRaises(SystemExit):
+            orbit_worker_agent.main(["pair", "--pairing-file", str(secret_file)])
+
+        # 3. Reading from stdin works without argv exposure
+        code = orbit_worker_agent._read_pairing_code(
+            pairing_stdin=True,
+            stdin_stream=io.StringIO("stdin-secret-code\n"),
+        )
+        self.assertEqual(code, "stdin-secret-code")
+
+        # 4. Loopback host & URL policy
+        with self.assertRaises(ValueError):
+            assert_loopback_host("0.0.0.0")
+        with self.assertRaises(ValueError):
+            assert_loopback_url("http://100.115.247.63:8765")
+        tunnel = build_remote_tunnel_spec()
+        self.assertFalse(tunnel["public_exposure"])
+        self.assertFalse(tunnel["operator_privileged_over_tunnel"])
+
+    def test_08_actual_orbit_fastapi_dashboard_integration(self) -> None:
+        workspace = self.base / "orbit_ws"
+        workspace.mkdir()
+        settings = Settings(
+            model="mock-local",
+            base_url="http://test.invalid/v1",
+            api_key="",
+            workspace=workspace,
+            database=self.base / "orbit.sqlite3",
+            bind="127.0.0.1",
+            port=8765,
+        )
+        model_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+            )
+        )
+        self.addCleanup(model_client.close)
+
+        orbit_app = create_app(settings, model_client)
+        with TestClient(orbit_app, base_url="http://127.0.0.1") as client:
+            health0 = client.get("/api/health").json()
+            self.assertEqual(health0["status"], "ok")
+            self.assertEqual(health0["worker_protocol"], PROTOCOL)
+            self.assertEqual(health0["workers_live"], 0)
+
+            proto = client.get("/api/workers/protocol").json()
+            self.assertEqual(proto["protocol"], PROTOCOL)
+            self.assertEqual(proto["operator_authentication"], "bearer-operator-token")
+
+            # Unauthenticated pairing attempt on the main ORBIT app is blocked (401)
+            self.assertEqual(client.post("/api/workers/pairing").status_code, 401)
+
+            # Use the broker's scoped operator token to mint a pairing code
+            app_broker: WorkerBroker = orbit_app.state.worker_broker
+            op_hdr = {"Authorization": f"Bearer {app_broker.operator_token}"}
+            code = client.post("/api/workers/pairing", headers=op_hdr).json()["pairing_code"]
+
+            worker = AntigravityWorker(
+                "http://127.0.0.1",
+                client=client,
+                state_path=self.base / "ag-state.json",
+                workspace_root=workspace,
+                inventory=self.inventory,
+                worker_id="antigravity-NightKnightPC",
+            )
+            worker.pair(code)
+            beat = worker.heartbeat("IDLE")
+            self.assertEqual(beat["presence"], "LIVE")
+
+            health1 = client.get("/api/health").json()
+            self.assertEqual(health1["workers_live"], 1)
+            self.assertEqual(health1["live_worker_ids"], ["antigravity-NightKnightPC"])
+
+            # Enqueue and execute a smoke_check task through the ORBIT dashboard
+            enq = client.post(
+                "/api/workers/tasks",
+                headers=op_hdr,
+                json={
+                    "type": "orbit.smoke_check",
+                    "payload": {"output_path": "DASHBOARD-PROOF.md"},
+                    "grant": "local",
+                },
+            )
+            self.assertEqual(enq.status_code, 201)
+            outcome = worker.handle_once()
+            self.assertEqual(outcome["action"], "completed")
+            self.assertTrue((workspace / "DASHBOARD-PROOF.md").is_file())
+
+            workers_html = client.get("/workers").text
+            self.assertIn("antigravity-NightKnightPC", workers_html)
+            self.assertIn("LIVE", workers_html)
+            self.assertNotIn(worker.token, workers_html)
 
 
 if __name__ == "__main__":

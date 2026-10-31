@@ -1,193 +1,369 @@
-"""ORBIT Worker Protocol v0.1, Runtime Discovery & Authenticated Worker Adapter (Issue #12 / #13).
+"""Unified ORBIT Worker Protocol (orbit.workers.v0.1) Broker & Antigravity Adapter.
 
-Provides:
-1. Real local runtime & host capability discovery for Google Antigravity (AGY),
-   Hermes Agent, OpenCode (ALEX), and LUNA without fabricating live statuses or
-   conflating worker harnesses with LLM models.
-2. Versioned ORBIT Worker Protocol v0.1 data contracts:
-   WorkerManifest, TaskOffer, Lease, TaskProgress, TaskResult, Cancel.
-3. Authenticated loopback pairing (short-lived single-use pairing code + client
-   nonce anti-replay -> scoped worker bearer token hashed at rest, secret masking).
-4. Safe, lease-based task polling, claiming, heartbeat liveness, progress events,
-   deterministic cancellation, and grant-confined non-destructive task execution
-   with server-side file artifact verification (SHA-256 / content checks).
-5. Authenticated SSH / Tailscale loopback forwarding specifications for remote
-   hosts (ubuntu-hermes, nightknight-server, detti) without public binds.
+Reconciles PR #14 (Antigravity / host runtime discovery) and PR #15 (Grok
+`orbit.workers.v0.1` broker) into a single canonical wire protocol and shared
+SQLite broker (`WorkerBroker`) mounted at `/api/workers`.
+
+Security invariants:
+1. Loopback-only bind (`127.0.0.1` / `localhost`). Remote hosts must use
+   authenticated SSH / Tailscale loopback forwarding.
+2. Operator endpoints (`POST /api/workers/pairing`, `/revoke`, `/tasks`,
+   `/tasks/{id}/cancel`) require a scoped Operator bearer token
+   (`Authorization: Bearer <operator_token>` or `X-Orbit-Operator-Token`).
+   Worker bearer tokens are rejected with 403 on operator endpoints, and
+   operator tokens are rejected with 403 on worker endpoints. Requests carrying
+   proxy/forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) are
+   denied on operator routes.
+3. Worker endpoints (`POST /api/workers/heartbeat`, `/poll`,
+   `/tasks/{id}/progress`, `/tasks/{id}/result`) require a paired worker bearer
+   token plus a unique per-request `X-Orbit-Nonce` and `X-Orbit-Timestamp`
+   within the clock skew window. Nonce replay detection is atomic in SQLite
+   (concurrent collisions return 409, never 500).
+4. Pairing codes, worker tokens, and operator tokens are stored exclusively as
+   SHA-256 digests in SQLite. Secret/state files on disk are created with mode
+   `0600` via `os.open(..., O_CREAT | O_EXCL | O_WRONLY, 0o600)` before writing
+   any bytes.
+5. Runtime discovery (`GET /api/workers/discovery`) strictly separates observed
+   local processes/tools from connected, authenticated workers with verified
+   ORBIT-executable task handlers.
 """
+
 from __future__ import annotations
 
 import hashlib
-import hmac
+import html
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
 import sqlite3
-import tempfile
+import stat
+import subprocess
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .tools import DENIED_NAMES, DENIED_SUFFIXES, MAX_READ_BYTES, MAX_WRITE_CHARS, checked_path
+PROTOCOL = "orbit.workers.v0.1"
+PROTOCOL_VERSION = PROTOCOL
+ADAPTER_VERSION = "0.1.0"
 
-PROTOCOL_VERSION = "v0.1"
-WORKER_STATES = ("IDLE", "LIVE", "BUSY", "DEGRADED", "ERROR", "OFFLINE", "BLOCKED")
-LEASE_STATES = ("ACTIVE", "COMPLETED", "EXPIRED", "CANCELLED", "FAILED")
-TASK_STATES = ("PENDING", "ASSIGNED", "RUNNING", "SUBMITTED", "VERIFIED", "FAILED", "BLOCKED", "CANCELLED")
-ALLOWED_TASK_OPS = frozenset({"deliver", "retry-deliver", "workspace.inspect", "workspace.read", "workspace.write_scoped", "inspect", "read"})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "testserver"})
+WORKER_STATUSES = frozenset({"IDLE", "BUSY", "ERROR", "BLOCKED", "OFFLINE"})
+RESULT_STATUSES = frozenset({"completed", "rejected", "cancelled", "error"})
+PROGRESS_STATUSES = frozenset({"accepted", "running", "cancelling"})
+TERMINAL_TASK_STATUSES = frozenset({"completed", "rejected", "cancelled", "error"})
 
-DEFAULT_PAIRING_TTL = 300.0      # 5 minutes for one-time pairing credential
-DEFAULT_TOKEN_TTL = 86_400.0     # 24 hours for scoped worker token
-DEFAULT_HEARTBEAT_TTL = 20.0     # 20 seconds before worker is aged OFFLINE
-DEFAULT_LEASE_TTL = 60.0         # 60 seconds per task lease
+EXECUTABLE_CAPABILITIES = ("orbit.inventory", "orbit.ping", "orbit.smoke_check")
 
-ANTIGRAVITY_TOOLS: tuple[str, ...] = (
+ANTIGRAVITY_OBSERVED_TOOLS = (
     "run_command",
     "view_file",
     "write_to_file",
     "replace_file_content",
+    "multi_replace_file_content",
+    "grep_search",
+    "find_by_name",
+    "list_dir",
+    "ask_question",
     "search_web",
     "read_url_content",
     "invoke_subagent",
-    "define_subagent",
-    "manage_subagents",
-    "send_message",
     "schedule",
-    "manage_task",
-    "ask_question",
 )
 
-
-class WorkerProtocolError(RuntimeError):
-    """Raised on worker protocol or state violations."""
-
-
-class WorkerAuthError(WorkerProtocolError):
-    """Raised on invalid, expired, replayed, or revoked worker credentials."""
-
-
-class WorkerCancelledError(WorkerProtocolError):
-    """Raised when a leased task has been cancelled by the coordinator."""
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_CAP_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
+_NONCE_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+_GRANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv"}
+_FORWARDED_HEADERS = ("x-forwarded-for", "forwarded", "x-real-ip", "x-forwarded-host")
 
 
-def mask_secret(value: str | None) -> str:
-    """Mask a pairing code or bearer token so raw secrets never appear in logs or UI."""
-    if not value or not isinstance(value, str):
-        return "<empty>"
-    clean = value.strip()
-    if len(clean) <= 10:
-        return "***REDACTED***"
-    return f"{clean[:6]}...{clean[-4:]}"
+class ProtocolError(Exception):
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
 
 
-def _sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+class WorkerClientError(RuntimeError):
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"ORBIT worker request failed ({status}): {detail}")
+        self.status = status
+        self.detail = detail
 
 
-def _file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+class ManualClock:
+    """Injectable deterministic clock for unit and integration tests."""
+
+    def __init__(self, start: datetime | None = None) -> None:
+        self.current = start or datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current = self.current + timedelta(seconds=seconds)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def isoformat(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def assert_loopback_host(host: str) -> str:
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("worker broker refuses a non-loopback bind")
+    return "127.0.0.1"
+
+
+def assert_loopback_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("ORBIT_URL must be an http loopback origin")
+    if parsed.hostname not in {"127.0.0.1", "localhost", "testserver"}:
+        raise ValueError("ORBIT_URL must be loopback; use an SSH local forward for a remote host")
+    if parsed.path not in {"", "/"}:
+        raise ValueError("ORBIT_URL must be an origin")
+    return url.rstrip("/")
+
+
+def scrub(text: str, secrets_list: list[str] | None = None) -> str:
+    cleaned = _BEARER_RE.sub("Bearer [redacted]", text or "")
+    for item in secrets_list or []:
+        if item:
+            cleaned = cleaned.replace(item, "[redacted]")
+    return cleaned
+
+
+def bounded_json(value: Any, limit: int = 16000) -> str:
+    try:
+        raw = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(400, "value is not JSON") from exc
+    if len(raw.encode("utf-8")) > limit:
+        raise ProtocolError(400, "JSON value is too large")
+    return raw
+
+
+def valid_nonce(value: str | None) -> str:
+    if not value or not _NONCE_RE.fullmatch(value):
+        raise ProtocolError(401, "nonce rejected")
+    return value
+
+
+def write_secret_file(path: Path, content: str) -> None:
+    """Create a secret file with 0600 permissions before writing any bytes."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+        os.replace(tmp_path, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def read_secret_file(path: Path) -> str:
+    """Read a secret file after verifying it is not group/world accessible."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Secret file not found: {path}")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise PermissionError(f"Refusing to read secret file with insecure permissions ({oct(mode)}): {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def save_state(path: Path, data: dict[str, Any]) -> None:
+    write_secret_file(Path(path), json.dumps(data, indent=2, sort_keys=True))
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    raw = read_secret_file(Path(path))
+    return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------
-# Protocol v0.1 Dataclasses
+# Canonical orbit.workers.v0.1 Pydantic Models & Dataclasses
 # ---------------------------------------------------------------------------
+
+
+class Manifest(BaseModel):
+    worker_id: str = Field(pattern=_ID_RE.pattern)
+    runtime_name: str = Field(min_length=1, max_length=80)
+    host_id: str = Field(min_length=1, max_length=80)
+    model_id: str | None = Field(default=None, max_length=120)
+    model_id_source: str | None = Field(default=None, max_length=80)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
+    status: str = "IDLE"
+    version: str = Field(default=ADAPTER_VERSION, min_length=1, max_length=40)
+    inventory: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("status")
+    @classmethod
+    def known_status(cls, value: str) -> str:
+        if value not in WORKER_STATUSES:
+            raise ValueError("unknown worker status")
+        return value
+
+    @field_validator("capabilities")
+    @classmethod
+    def known_caps(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not _CAP_RE.fullmatch(item):
+                raise ValueError("invalid capability")
+        return value
+
+
+class PairRequest(BaseModel):
+    protocol: str = PROTOCOL
+    pairing_code: str = Field(min_length=8, max_length=200)
+    manifest: Manifest
+
+
+class HeartbeatRequest(BaseModel):
+    manifest: Manifest
+
+
+class TaskCreate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    task_type: str = Field(alias="type", pattern=_CAP_RE.pattern)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    required_capabilities: list[str] = Field(default_factory=list, max_length=64)
+    grant: str = Field(default="local", pattern=_GRANT_RE.pattern)
+    task_id: str | None = Field(default=None, pattern=_ID_RE.pattern)
+
+    @field_validator("required_capabilities")
+    @classmethod
+    def known_required(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not _CAP_RE.fullmatch(item):
+                raise ValueError("invalid capability")
+        return value
+
+
+class ProgressRequest(BaseModel):
+    lease_id: str = Field(min_length=8, max_length=80)
+    event_id: str = Field(pattern=_ID_RE.pattern)
+    status: str
+    message: str = Field(default="", max_length=400)
+    progress: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("status")
+    @classmethod
+    def known_progress(cls, value: str) -> str:
+        if value not in PROGRESS_STATUSES:
+            raise ValueError("unknown progress status")
+        return value
+
+
+class ResultRequest(BaseModel):
+    lease_id: str = Field(min_length=8, max_length=80)
+    status: str
+    result: dict[str, Any] = Field(default_factory=dict)
+    log_excerpt: str = Field(default="", max_length=2000)
+
+    @field_validator("status")
+    @classmethod
+    def known_result(cls, value: str) -> str:
+        if value not in RESULT_STATUSES:
+            raise ValueError("unknown result status")
+        return value
+
+
+class RevokeRequest(BaseModel):
+    worker_id: str = Field(pattern=_ID_RE.pattern)
+
 
 @dataclass
 class WorkerManifest:
-    """Truthful declaration of a worker runtime (harness != LLM model)."""
-    worker_id: str
-    runtime_name: str               # e.g. 'antigravity', 'hermes', 'opencode', 'luna'
-    host_id: str                    # e.g. 'NightKnightPC'
-    model_id: str | None = None     # e.g. 'Gemini 4 Argon (Medium)'; None if unknown
-    capabilities: tuple[str, ...] = ("orbit.plan.deliver", "workspace.inspect", "workspace.read", "workspace.write_scoped")
-    tool_allowlist: tuple[str, ...] = ()
-    skills: tuple[str, ...] = ()
-    status: str = "IDLE"            # IDLE | LIVE | BUSY | DEGRADED | ERROR | OFFLINE
-    version: str = "0.1.0"
-    heartbeat_at: float = field(default_factory=time.time)
-    transport: str = "loopback-http"
-    resources: dict[str, Any] = field(default_factory=dict)
-    endpoint: str | None = None
-    notes: str = ""
+    """Dataclass representation of a runtime manifest and discovery state."""
 
-    def to_dict(self) -> dict[str, Any]:
+    worker_id: str
+    runtime_name: str
+    host_id: str
+    model_id: str | None
+    capabilities: list[str]
+    status: str
+    version: str = ADAPTER_VERSION
+    model_id_source: str | None = "harness_session_identity"
+    inventory: dict[str, Any] = field(default_factory=dict)
+    discovered: bool = True
+    connected: bool = False
+    authorized_to_execute: bool = False
+
+    def to_protocol_manifest(self) -> dict[str, Any]:
         return {
             "worker_id": self.worker_id,
-            "id": self.worker_id,
-            "name": self.worker_id,
             "runtime_name": self.runtime_name,
-            "kind": self.runtime_name,
             "host_id": self.host_id,
-            "host": self.host_id,
             "model_id": self.model_id,
+            "model_id_source": self.model_id_source,
             "capabilities": list(self.capabilities),
-            "tool_allowlist": list(self.tool_allowlist),
-            "skills": list(self.skills),
-            "skill_count": len(self.skills),
-            "status": self.status,
+            "status": self.status if self.status in WORKER_STATUSES else "IDLE",
             "version": self.version,
-            "heartbeat_at": self.heartbeat_at,
-            "transport": self.transport,
-            "resources": dict(self.resources),
-            "endpoint": self.endpoint,
-            "notes": self.notes,
+            "inventory": dict(self.inventory),
         }
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WorkerManifest":
-        wid = str(data.get("worker_id") or data.get("id") or data.get("name") or "").strip()
-        runtime = str(data.get("runtime_name") or data.get("kind") or "").strip()
-        host = str(data.get("host_id") or data.get("host") or socket.gethostname()).strip()
-        if not wid or not runtime:
-            raise ValueError("worker_id and runtime_name are required in WorkerManifest")
-        status = str(data.get("status") or "IDLE").upper().strip()
-        if status not in WORKER_STATES:
-            raise ValueError(f"Invalid worker status: {status}")
-        model_id = data.get("model_id")
-        if model_id is not None:
-            model_id = str(model_id).strip() or None
-        return cls(
-            worker_id=wid[:80],
-            runtime_name=runtime[:40],
-            host_id=host[:80],
-            model_id=model_id,
-            capabilities=tuple(str(x) for x in (data.get("capabilities") or ())),
-            tool_allowlist=tuple(str(x) for x in (data.get("tool_allowlist") or ())),
-            skills=tuple(str(x) for x in (data.get("skills") or ())),
-            status=status,
-            version=str(data.get("version") or "0.1.0")[:40],
-            heartbeat_at=float(data.get("heartbeat_at") or time.time()),
-            transport=str(data.get("transport") or "loopback-http")[:40],
-            resources=dict(data.get("resources") or {}),
-            endpoint=str(data["endpoint"])[:200] if data.get("endpoint") else None,
-            notes=str(data.get("notes") or "")[:300],
-        )
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
 class TaskOffer:
-    """Scoped task offered to an eligible worker."""
-    task_id: str
-    mission_id: str
-    title: str
-    capability_required: str
-    spec: dict[str, Any]
-    grant: dict[str, Any]
-    attempt: int = 1
-    created_at: float = field(default_factory=time.time)
+    type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    required_capabilities: list[str] = field(default_factory=list)
+    grant: str = "local"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -195,29 +371,29 @@ class TaskOffer:
 
 @dataclass
 class Lease:
-    """Bounded-time exclusive task lease held by one worker."""
     lease_id: str
     task_id: str
-    mission_id: str
-    worker_id: str
-    acquired_at: float
-    expires_at: float
-    status: str = "ACTIVE"
+    expires_at: str
+    cancel_requested: bool
+    offer: TaskOffer
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "lease_id": self.lease_id,
+            "task_id": self.task_id,
+            "expires_at": self.expires_at,
+            "cancel_requested": self.cancel_requested,
+            "offer": self.offer.to_dict(),
+        }
 
 
 @dataclass
 class TaskProgress:
-    """Incremental progress event reported under an active lease."""
-    task_id: str
     lease_id: str
-    worker_id: str
-    stage: str
-    percent: int
+    event_id: str
+    status: str
     message: str
-    timestamp: float = field(default_factory=time.time)
+    progress: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -225,71 +401,89 @@ class TaskProgress:
 
 @dataclass
 class TaskResult:
-    """Structured task completion or failure report with artifact digests."""
-    task_id: str
     lease_id: str
-    worker_id: str
-    status: str  # SUBMITTED | SUCCEEDED | FAILED | BLOCKED | CANCELLED | DEGRADED
-    summary: str
-    artifacts: list[dict[str, Any]] = field(default_factory=list)
-    logs: list[str] = field(default_factory=list)
-    completed_at: float = field(default_factory=time.time)
+    status: str
+    result: dict[str, Any] = field(default_factory=dict)
+    log_excerpt: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "task_id": self.task_id,
-            "lease_id": self.lease_id,
-            "worker_id": self.worker_id,
-            "status": self.status,
-            "summary": self.summary[:2000],
-            "artifacts": self.artifacts[:20],
-            "logs": [str(line)[:300] for line in self.logs[:50]],
-            "completed_at": self.completed_at,
-        }
+        return asdict(self)
 
 
 @dataclass
 class Cancel:
-    """Deterministic task/lease cancellation directive."""
     task_id: str
-    lease_id: str | None
     reason: str
-    cancelled_at: float = field(default_factory=time.time)
+    requested_at: str = field(default_factory=lambda: isoformat(utcnow()))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# Real Host & Runtime Discovery (No Invented Capabilities)
+# Truthful Host & Runtime Discovery Probes
 # ---------------------------------------------------------------------------
 
-def inspect_host_resources() -> dict[str, Any]:
-    """Read real CPU, RAM, and AMD/Linux DRM VRAM metrics from /proc and /sys without spawning GPU jobs."""
-    uname = platform.uname()
-    cpu_model = uname.processor or "unknown"
-    cpuinfo = Path("/proc/cpuinfo")
-    if cpuinfo.is_file():
-        try:
-            for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
-                if line.lower().startswith("model name"):
-                    cpu_model = line.partition(":")[2].strip()
-                    break
-        except OSError:
-            pass
 
-    mem_total_kib = 0
-    mem_avail_kib = 0
-    meminfo = Path("/proc/meminfo")
-    if meminfo.is_file():
-        try:
-            for line in meminfo.read_text(encoding="utf-8", errors="replace").splitlines():
-                if line.startswith("MemTotal:"):
-                    mem_total_kib = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_avail_kib = int(line.split()[1])
-        except (OSError, ValueError, IndexError):
-            pass
+def scan_skill_names(roots: list[Path], limit: int = 200) -> list[str]:
+    """Return skill directory names without reading SKILL.md file contents."""
+    names: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        resolved = root.resolve()
+        if not resolved.is_dir():
+            continue
+        for current, dirs, files in os.walk(resolved, followlinks=False):
+            kept = []
+            for name in dirs:
+                path = Path(current) / name
+                if name in _SKIP_DIRS or name.startswith("."):
+                    continue
+                if path.is_symlink():
+                    target = Path(os.path.realpath(path))
+                    if target.is_dir() and (target / "SKILL.md").is_file():
+                        relative = Path(current, name).relative_to(resolved).as_posix()
+                        names.append(relative)
+                    continue
+                kept.append(name)
+            dirs[:] = kept
+            if "SKILL.md" in files:
+                relative = Path(current).relative_to(resolved).as_posix()
+                names.append("." if relative == "." else relative)
+    return sorted(set(names))[:limit]
+
+
+def default_antigravity_skill_roots() -> list[Path]:
+    home = Path.home()
+    return [
+        home / ".gemini" / "config" / "skills",
+        home / ".gemini" / "antigravity" / "builtin" / "skills",
+    ]
+
+
+def inspect_host_resources() -> dict[str, Any]:
+    """Read real CPU, RAM, and DRM GPU VRAM metrics from the local Linux host."""
+    cpu_model = platform.processor() or "unknown"
+    mem_total_mib = 0
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+        for line in cpuinfo.splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+
+    try:
+        meminfo = Path("/proc/meminfo").read_text(encoding="utf-8", errors="ignore")
+        for line in meminfo.splitlines():
+            if line.startswith("MemTotal:"):
+                kb = int(line.split()[1])
+                mem_total_mib = kb // 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
 
     gpus: list[dict[str, Any]] = []
     drm_root = Path("/sys/class/drm")
@@ -297,1951 +491,1730 @@ def inspect_host_resources() -> dict[str, Any]:
         for card_dir in sorted(drm_root.glob("card[0-9]*")):
             if "-" in card_dir.name:
                 continue
-            vram_total_path = card_dir / "device" / "mem_info_vram_total"
-            vram_used_path = card_dir / "device" / "mem_info_vram_used"
-            if vram_total_path.is_file():
+            vram_file = card_dir / "device" / "mem_info_vram_total"
+            if vram_file.is_file():
                 try:
-                    total_b = int(vram_total_path.read_text(encoding="utf-8").strip())
-                    used_b = int(vram_used_path.read_text(encoding="utf-8").strip()) if vram_used_path.is_file() else 0
-                    gpus.append({
-                        "card": card_dir.name,
-                        "vram_total_mib": round(total_b / (1024 * 1024)),
-                        "vram_used_mib": round(used_b / (1024 * 1024)),
-                    })
+                    vram_bytes = int(vram_file.read_text(encoding="utf-8").strip())
+                    gpus.append(
+                        {
+                            "card": card_dir.name,
+                            "vram_mib": vram_bytes // (1024 * 1024),
+                        }
+                    )
                 except (OSError, ValueError):
-                    continue
+                    pass
 
     return {
-        "hostname": uname.node or socket.gethostname(),
-        "os": f"{uname.system} {uname.release} {uname.machine}",
+        "hostname": socket.gethostname(),
+        "os": f"{platform.system()} {platform.release()}",
+        "arch": platform.machine(),
         "cpu_model": cpu_model,
         "cpu_threads": os.cpu_count() or 1,
-        "ram_total_mib": round(mem_total_kib / 1024) if mem_total_kib else None,
-        "ram_available_mib": round(mem_avail_kib / 1024) if mem_avail_kib else None,
+        "ram_total_mib": mem_total_mib,
         "gpus": gpus,
     }
 
 
-def _discover_skill_names(*roots: Path) -> tuple[str, ...]:
-    found: set[str] = set()
-    for root in roots:
-        if not root.is_dir():
-            continue
-        try:
-            for item in sorted(root.iterdir()):
-                if (item.is_dir() or item.is_symlink()) and not item.name.startswith("."):
-                    if (item / "SKILL.md").is_file():
-                        found.add(item.name)
-        except OSError:
-            continue
-    return tuple(sorted(found))
+def _http_json_probe(url: str, timeout: float = 1.5) -> tuple[bool, dict[str, Any] | None]:
+    parsed = urlsplit(url)
+    if parsed.hostname not in LOOPBACK_HOSTS:
+        return False, None
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                raw = resp.read(16384).decode("utf-8", errors="replace")
+                try:
+                    data = json.loads(raw)
+                    return True, data if isinstance(data, dict) else {"raw": raw[:200]}
+                except json.JSONDecodeError:
+                    return True, {"raw": raw[:200]}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        pass
+    return False, None
+
+
+def inspect_hermes_runtime(health_url: str = "http://127.0.0.1:8642/health") -> dict[str, Any]:
+    """Probe local Hermes gateway presence without marking it ORBIT-connected."""
+    ok, payload = _http_json_probe(health_url)
+    version = str(payload.get("version") or "0.22.5") if ok and isinstance(payload, dict) else "unknown"
+    return {
+        "runtime_name": "hermes",
+        "discovered": ok,
+        "probe_status": "OBSERVED_LOCAL" if ok else "OFFLINE",
+        "connected": False,
+        "authorized_to_execute": False,
+        "executable_capabilities": [],
+        "endpoint": health_url,
+        "version": version,
+    }
+
+
+def inspect_opencode_runtime(doc_url: str | None = None) -> dict[str, Any]:
+    """Probe local OpenCode service presence without marking it ORBIT-connected."""
+    binary = shutil.which("opencode") or (
+        str(Path.home() / ".opencode" / "bin" / "opencode")
+        if (Path.home() / ".opencode" / "bin" / "opencode").is_file()
+        else None
+    )
+    target_url = doc_url or os.getenv("OPENCODE_DOC_URL", "http://127.0.0.1:49374/doc")
+    ok, _ = _http_json_probe(target_url)
+    return {
+        "runtime_name": "opencode",
+        "discovered": bool(ok or binary),
+        "probe_status": "OBSERVED_LOCAL" if ok else ("BINARY_ONLY" if binary else "OFFLINE"),
+        "connected": False,
+        "authorized_to_execute": False,
+        "executable_capabilities": [],
+        "endpoint": target_url,
+        "binary_present": bool(binary),
+    }
+
+
+def inspect_luna_runtime(tunnel_url: str | None = None) -> dict[str, Any]:
+    """Probe optional SSH/Tailscale loopback tunnel for remote Ubuntu/detti LUNA."""
+    target_url = tunnel_url or os.getenv("ORBIT_LUNA_TUNNEL_URL", "http://127.0.0.1:18765/health")
+    ok, _ = _http_json_probe(target_url, timeout=0.8)
+    return {
+        "runtime_name": "luna",
+        "discovered": ok,
+        "probe_status": "OBSERVED_TUNNEL" if ok else "OFFLINE",
+        "connected": False,
+        "authorized_to_execute": False,
+        "executable_capabilities": [],
+        "endpoint": target_url,
+        "transport": "ssh-tailscale-loopback-forward",
+    }
+
+
+def build_antigravity_inventory(
+    *,
+    skill_roots: list[Path] | None = None,
+    host_id: str | None = None,
+    binary_path: Path | None = None,
+    model_id: str = "Gemini 4 Argon (Medium)",
+) -> dict[str, Any]:
+    """Build truthful Antigravity inventory separating observed tools from ORBIT handlers."""
+    roots = default_antigravity_skill_roots() if skill_roots is None else skill_roots
+    discovered_skills = scan_skill_names(roots, limit=10000)
+    skill_names = discovered_skills[:200]
+    host_res = inspect_host_resources()
+    resolved_host = host_id or host_res["hostname"]
+
+    ag_bin = binary_path or (Path.home() / ".local" / "opt" / "Antigravity-x64" / "antigravity")
+    ag_present = ag_bin.is_file() or bool(shutil.which("antigravity") or shutil.which("agy"))
+
+    inventory: dict[str, Any] = {
+        "runtime_name": "antigravity",
+        "adapter_version": ADAPTER_VERSION,
+        "binary_present": ag_present,
+        "model_id": model_id if ag_present else None,
+        "model_id_source": "harness_session_identity" if ag_present else None,
+        "model_endpoint_probed": False,
+        "model_ready": False,
+        "host_id": resolved_host,
+        "os": platform.system(),
+        "python": platform.python_version(),
+        "executable_capabilities": list(EXECUTABLE_CAPABILITIES) if ag_present else [],
+        "arbitrary_shell_from_dashboard": False,
+        "observed_session_tools": list(ANTIGRAVITY_OBSERVED_TOOLS) if ag_present else [],
+        "observed_session_tools_executable_through_orbit": False,
+        "observed_session_tools_source": "antigravity_session_2026-10-31",
+        "mcp_tools_invoked": False,
+        "skill_count": len(discovered_skills),
+        "skill_names": skill_names,
+        "skill_names_truncated": len(discovered_skills) > len(skill_names),
+        "skills_executable_through_orbit": False,
+        "host_resources": host_res,
+        "discovered_sibling_runtimes": {
+            "hermes": inspect_hermes_runtime(),
+            "opencode": inspect_opencode_runtime(),
+            "luna": inspect_luna_runtime(),
+        },
+    }
+    if len(json.dumps(inventory).encode("utf-8")) > 12000:
+        inventory["skill_names"] = skill_names[:40]
+        inventory["skill_names_truncated"] = True
+    return inventory
 
 
 def inspect_antigravity_runtime(
     *,
     worker_id: str | None = None,
     model_id: str = "Gemini 4 Argon (Medium)",
+    skill_roots: list[Path] | None = None,
     binary_path: Path | None = None,
-    skill_roots: tuple[Path, ...] | None = None,
 ) -> WorkerManifest:
-    """Inspect the local Google Antigravity (AGY) agent runtime truthfully."""
-    home = Path.home()
-    resources = inspect_host_resources()
-    host_id = resources["hostname"]
-    wid = worker_id or f"antigravity-{host_id.lower()}"
+    """Inspect the local Antigravity runtime.
 
-    default_bin = binary_path or Path("/home/nightknight/.local/opt/Antigravity-x64/antigravity")
-    agy_dir = home / ".gemini" / "antigravity"
-    roots = skill_roots if skill_roots is not None else (
-        home / ".gemini" / "config" / "skills",
-        agy_dir / "builtin" / "skills",
+    Note: `connected` and `authorized_to_execute` remain False until the worker
+    pairs and sends a live heartbeat to the ORBIT WorkerBroker.
+    """
+    inv = build_antigravity_inventory(
+        skill_roots=skill_roots,
+        binary_path=binary_path,
+        model_id=model_id,
     )
-    skills = _discover_skill_names(*roots)
-
-    bin_exists = default_bin.is_file() or shutil.which("antigravity") is not None or agy_dir.is_dir()
-    status = "IDLE" if bin_exists else "OFFLINE"
-
-    capabilities: list[str] = [
-        "orbit.plan.deliver",
-        "workspace.inspect",
-        "workspace.read",
-        "workspace.write_scoped",
-        "unittest.run",
-    ]
-    if any(s.startswith("reverse-") for s in skills):
-        capabilities.append("reverse_engineering.arsenal")
-
+    ag_present = bool(inv.get("binary_present"))
+    host = str(inv.get("host_id") or "localhost")
+    safe_host = "".join(ch if ch.isalnum() or ch in ".-" else "-" for ch in host)[:40] or "host"
     return WorkerManifest(
-        worker_id=wid,
+        worker_id=worker_id or f"antigravity-{safe_host}",
         runtime_name="antigravity",
-        host_id=host_id,
-        model_id=model_id if status != "OFFLINE" else None,
-        capabilities=tuple(capabilities) if status != "OFFLINE" else (),
-        tool_allowlist=ANTIGRAVITY_TOOLS if status != "OFFLINE" else (),
-        skills=skills,
-        status=status,
-        version="2.0-agy",
-        heartbeat_at=time.time(),
-        transport="loopback-http",
-        resources=resources,
-        endpoint=str(default_bin) if default_bin.is_file() else None,
-        notes=f"Google Antigravity worker ({len(skills)} verified local skills; human write approval preserved)",
+        host_id=host[:80],
+        model_id=inv.get("model_id"),
+        model_id_source=inv.get("model_id_source"),
+        capabilities=list(EXECUTABLE_CAPABILITIES) if ag_present else [],
+        status="IDLE" if ag_present else "OFFLINE",
+        version=ADAPTER_VERSION,
+        inventory=inv,
+        discovered=ag_present,
+        connected=False,
+        authorized_to_execute=False,
     )
 
 
-def inspect_hermes_runtime(
-    *,
+def manifest_from_inventory(
+    inventory: dict[str, Any],
     worker_id: str | None = None,
-    health_url: str = "http://127.0.0.1:8642/health",
-    binary_path: Path | None = None,
-    client: httpx.Client | None = None,
-    timeout: float = 1.5,
-) -> WorkerManifest:
-    """Probe the local Hermes Agent runtime (HTTP gateway on 127.0.0.1:8642 + CLI)."""
-    resources = inspect_host_resources()
-    host_id = resources["hostname"]
-    wid = worker_id or f"hermes-{host_id.lower()}"
-    hermes_bin = binary_path or Path.home() / ".local" / "bin" / "hermes"
-    skills = _discover_skill_names(Path.home() / ".agents" / "skills")
+    capabilities: list[str] | None = None,
+    runtime_name: str | None = None,
+) -> dict[str, Any]:
+    host = str(inventory.get("host_id") or socket.gethostname() or "localhost")
+    safe_host = "".join(ch if ch.isalnum() or ch in ".-" else "-" for ch in host)[:40] or "host"
+    rt_name = runtime_name or str(inventory.get("runtime_name") or "antigravity")
+    caps = list(capabilities) if capabilities is not None else list(inventory.get("executable_capabilities") or EXECUTABLE_CAPABILITIES)
+    status = "IDLE" if inventory.get("binary_present", True) else "OFFLINE"
+    return {
+        "worker_id": worker_id or f"{rt_name}-{safe_host}",
+        "runtime_name": rt_name,
+        "host_id": host[:80],
+        "model_id": inventory.get("model_id"),
+        "model_id_source": inventory.get("model_id_source"),
+        "capabilities": caps,
+        "status": status,
+        "version": str(inventory.get("adapter_version") or ADAPTER_VERSION),
+        "inventory": inventory,
+    }
 
-    version = "unknown"
-    gateway_ok = False
-    http_client = client or httpx.Client(timeout=timeout)
-    close_after = client is None
-    try:
-        resp = http_client.get(health_url, timeout=timeout)
-        if resp.status_code == 200:
-            payload = resp.json()
-            if payload.get("status") == "ok":
-                gateway_ok = True
-                version = str(payload.get("version") or "0.22.5")
-    except Exception:
-        gateway_ok = False
-    finally:
-        if close_after:
-            http_client.close()
-
-    cli_ok = hermes_bin.is_file() or shutil.which("hermes") is not None
-    status = "IDLE" if (gateway_ok or cli_ok) else "OFFLINE"
-
-    return WorkerManifest(
-        worker_id=wid,
-        runtime_name="hermes",
-        host_id=host_id,
-        model_id=None,  # Hermes is a worker runtime; model depends on active profile/provider
-        capabilities=("orbit.plan.deliver", "workspace.inspect", "workspace.read", "workspace.write_scoped") if status != "OFFLINE" else (),
-        tool_allowlist=("list_files", "read_file", "write_file") if status != "OFFLINE" else (),
-        skills=skills[:60],
-        status=status,
-        version=version,
-        heartbeat_at=time.time(),
-        transport="loopback-http",
-        resources=resources,
-        endpoint=health_url if gateway_ok else (str(hermes_bin) if cli_ok else None),
-        notes="Hermes local gateway live" if gateway_ok else ("Hermes CLI present (gateway offline)" if cli_ok else "Hermes runtime offline"),
-    )
-
-
-def inspect_opencode_runtime(
-    *,
-    worker_id: str | None = None,
-    service_url: str = "http://127.0.0.1:49374",
-    binary_path: Path | None = None,
-    client: httpx.Client | None = None,
-    timeout: float = 1.5,
-) -> WorkerManifest:
-    """Probe the local OpenCode (ALEX) worker runtime. Never mislabels OpenCode as an LLM model."""
-    resources = inspect_host_resources()
-    host_id = resources["hostname"]
-    wid = worker_id or f"opencode-{host_id.lower()}"
-    oc_bin = binary_path or Path.home() / ".local" / "bin" / "opencode"
-
-    service_ok = False
-    http_client = client or httpx.Client(timeout=timeout)
-    close_after = client is None
-    try:
-        resp = http_client.get(f"{service_url.rstrip('/')}/doc", timeout=timeout)
-        if resp.status_code == 200:
-            service_ok = True
-    except Exception:
-        service_ok = False
-    finally:
-        if close_after:
-            http_client.close()
-
-    cli_ok = oc_bin.is_file() or shutil.which("opencode") is not None
-    status = "IDLE" if (service_ok or cli_ok) else "OFFLINE"
-
-    return WorkerManifest(
-        worker_id=wid,
-        runtime_name="opencode",
-        host_id=host_id,
-        model_id=None,  # OpenCode is a worker harness, not an LLM model
-        capabilities=("orbit.plan.deliver", "workspace.inspect", "workspace.read", "workspace.write_scoped") if status != "OFFLINE" else (),
-        tool_allowlist=("list_files", "read_file", "write_file") if status != "OFFLINE" else (),
-        skills=(),
-        status=status,
-        version="2.2.1" if status != "OFFLINE" else "unknown",
-        heartbeat_at=time.time(),
-        transport="loopback-http",
-        resources=resources,
-        endpoint=service_url if service_ok else (str(oc_bin) if cli_ok else None),
-        notes="OpenCode service live on loopback" if service_ok else ("OpenCode CLI present" if cli_ok else "OpenCode runtime offline"),
-    )
-
-
-def inspect_luna_runtime(
-    *,
-    worker_id: str = "luna-ubuntu-remote",
-    host_id: str = "ubuntu-hermes",
-    tunnel_health_url: str | None = None,
-    client: httpx.Client | None = None,
-    timeout: float = 1.5,
-) -> WorkerManifest:
-    """Probe LUNA runtime via authenticated SSH/Tailscale tunnel; reports OFFLINE unless verified."""
-    tunnel_ok = False
-    version = "unknown"
-    if tunnel_health_url:
-        http_client = client or httpx.Client(timeout=timeout)
-        close_after = client is None
-        try:
-            resp = http_client.get(tunnel_health_url, timeout=timeout)
-            if resp.status_code == 200:
-                tunnel_ok = True
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                version = str(data.get("version") or "0.22.5")
-        except Exception:
-            tunnel_ok = False
-        finally:
-            if close_after:
-                http_client.close()
-
-    status = "IDLE" if tunnel_ok else "OFFLINE"
-    return WorkerManifest(
-        worker_id=worker_id,
-        runtime_name="luna",
-        host_id=host_id,
-        model_id=None,
-        capabilities=("orbit.plan.deliver", "workspace.inspect", "workspace.read") if tunnel_ok else (),
-        tool_allowlist=("list_files", "read_file") if tunnel_ok else (),
-        skills=(),
-        status=status,
-        version=version,
-        heartbeat_at=time.time(),
-        transport="tailscale-ssh-tunnel",
-        resources={},
-        endpoint=tunnel_health_url if tunnel_ok else None,
-        notes="Connected via authenticated SSH/Tailscale tunnel" if tunnel_ok else "Remote tunnel not active (OFFLINE — never fake READY)",
-    )
-
-
-def inspect_all_runtimes(client: httpx.Client | None = None) -> list[WorkerManifest]:
-    """Return truthful manifests for Antigravity, Hermes, OpenCode, and remote LUNA."""
-    return [
-        inspect_antigravity_runtime(),
-        inspect_hermes_runtime(client=client),
-        inspect_opencode_runtime(client=client),
-        inspect_luna_runtime(client=client),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Authenticated SSH / Tailscale Forwarding Specification (No Public Bind)
-# ---------------------------------------------------------------------------
 
 def build_remote_tunnel_spec(
     remote_host: str = "ubuntu-hermes",
-    *,
-    orbit_loopback_port: int = 8765,
+    remote_user: str = "nightknight",
+    local_orbit_port: int = 8765,
     remote_loopback_port: int = 18765,
-    tailscale_ip: str | None = None,
 ) -> dict[str, Any]:
-    """Propose authenticated SSH / Tailscale loopback forwarding without exposing 0.0.0.0."""
-    if not (1024 <= orbit_loopback_port <= 65535 and 1024 <= remote_loopback_port <= 65535):
-        raise ValueError("Port numbers must be unprivileged (1024..65535)")
-    target = tailscale_ip or remote_host
+    """Generate an authenticated SSH/Tailscale loopback tunnel specification.
+
+    Important: Forwarding only exposes worker routes (`/api/workers/pair`,
+    `/heartbeat`, `/poll`, `/tasks/{id}/progress`, `/tasks/{id}/result`).
+    Operator routes require a scoped operator bearer token and reject forwarded
+    headers.
+    """
     ssh_cmd = [
         "ssh",
-        "-NT",
-        "-o", "BatchMode=yes",
-        "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-        "-R", f"127.0.0.1:{remote_loopback_port}:127.0.0.1:{orbit_loopback_port}",
-        target,
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-R",
+        f"127.0.0.1:{remote_loopback_port}:127.0.0.1:{local_orbit_port}",
+        f"{remote_user}@{remote_host}",
     ]
     return {
-        "remote_host": remote_host,
-        "tailscale_ip": tailscale_ip,
-        "orbit_bind": f"127.0.0.1:{orbit_loopback_port}",
-        "remote_worker_orbit_url": f"http://127.0.0.1:{remote_loopback_port}",
+        "transport": "ssh-over-tailscale-loopback",
+        "local_bind": f"127.0.0.1:{local_orbit_port}",
+        "remote_loopback_bind": f"127.0.0.1:{remote_loopback_port}",
         "public_exposure": False,
-        "root_required": False,
-        "ssh_command": " ".join(ssh_cmd),
-        "ssh_argv": ssh_cmd,
-        "security_invariants": [
-            "ORBIT remains bound strictly to 127.0.0.1 on NightKnightPC.",
-            "Remote worker connects to its own 127.0.0.1 tunnel port forwarded over SSH/Tailscale.",
-            "Short-lived single-use pairing code is still required over the tunnel.",
-            "No 0.0.0.0 bind, LAN broadcast, or unauthenticated HTTP port is opened.",
-        ],
+        "operator_privileged_over_tunnel": False,
+        "command": " ".join(ssh_cmd),
+        "argv": ssh_cmd,
     }
 
 
 # ---------------------------------------------------------------------------
-# Coordinator SQLite Store & Engine (Worker API v0.1 + Issue #12 Compatible)
+# Unified WorkerBroker (orbit.workers.v0.1 + Scoped Operator Authentication)
 # ---------------------------------------------------------------------------
 
-class LocalWorkerCoordinator:
-    """SQLite-backed coordinator implementing ORBIT Worker Enrollment API v0.1.
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id TEXT PRIMARY KEY,
+    runtime_name TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    model_id TEXT,
+    model_id_source TEXT,
+    capabilities_json TEXT NOT NULL,
+    inventory_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    version TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_expires TEXT NOT NULL,
+    last_heartbeat TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS operator_tokens (
+    token_hash TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS pairing (
+    code_hash TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS nonces (
+    token_hash TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (token_hash, nonce)
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    task_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    required_json TEXT NOT NULL,
+    grant_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    worker_id TEXT,
+    lease_id TEXT,
+    lease_expires TEXT,
+    result_json TEXT,
+    log_excerpt TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    worker_id TEXT,
+    task_id TEXT,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capability_denials (
+    task_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    PRIMARY KEY (task_id, worker_id)
+);
+CREATE TABLE IF NOT EXISTS pair_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL
+);
+"""
 
-    Supports both standalone / embedded operation in ORBIT and full compatibility
-    with Issue #12's `/api/workers/v0.1/{register,poll,claim,heartbeat,report}` contract.
-    """
+
+def default_database() -> Path:
+    return Path.home() / ".local" / "share" / "nightknight-orbit" / "worker-broker.sqlite3"
+
+
+class WorkerBroker:
+    """Canonical `orbit.workers.v0.1` loopback coordinator with scoped operator auth."""
 
     def __init__(
         self,
         database: Path,
-        default_workspace: Path,
+        clock: Any | None = None,
         *,
-        heartbeat_ttl: float = DEFAULT_HEARTBEAT_TTL,
-        lease_ttl: float = DEFAULT_LEASE_TTL,
-        pairing_ttl: float = DEFAULT_PAIRING_TTL,
-        token_ttl: float = DEFAULT_TOKEN_TTL,
-    ):
+        operator_token: str | None = None,
+        operator_token_path: Path | None = None,
+        pairing_ttl: int = 600,
+        token_ttl: int = 12 * 3600,
+        offline_after: int = 20,
+        lease_ttl: int = 60,
+        timestamp_skew: int = 60,
+        failure_limit: int = 8,
+        failure_window: int = 60,
+    ) -> None:
         self.database = Path(database)
-        self.default_workspace = Path(default_workspace).resolve()
-        self.heartbeat_ttl = heartbeat_ttl
-        self.lease_ttl = lease_ttl
+        self.clock = clock
         self.pairing_ttl = pairing_ttl
         self.token_ttl = token_ttl
+        self.offline_after = offline_after
+        self.lease_ttl = lease_ttl
+        self.timestamp_skew = timestamp_skew
+        self.failure_limit = failure_limit
+        self.failure_window = failure_window
+        self._lock = threading.RLock()
         self.database.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    @contextmanager
-    def connect(self):
-        db = sqlite3.connect(self.database, timeout=30)
+        self._conn = sqlite3.connect(self.database, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
         try:
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA journal_mode = WAL")
-            db.execute("PRAGMA foreign_keys = ON")
-            db.execute("PRAGMA busy_timeout = 30000")
-            with db:
-                yield db
-        finally:
-            db.close()
+            os.chmod(self.database, 0o600)
+        except OSError:
+            pass
 
-    def _init_db(self) -> None:
-        with self.connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS worker_pairings (
-                    pairing_id TEXT PRIMARY KEY,
-                    code_sha256 TEXT NOT NULL UNIQUE,
-                    code_hint TEXT NOT NULL,
-                    allowed_runtime TEXT,
-                    scopes_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    used_at REAL,
-                    revoked_at REAL,
-                    used_by_worker_id TEXT
-                );
-                CREATE TABLE IF NOT EXISTS worker_tokens (
-                    token_id TEXT PRIMARY KEY,
-                    worker_id TEXT NOT NULL,
-                    token_sha256 TEXT NOT NULL UNIQUE,
-                    token_hint TEXT NOT NULL,
-                    scopes_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    revoked_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS worker_nonces (
-                    nonce_sha256 TEXT PRIMARY KEY,
-                    worker_id TEXT NOT NULL,
-                    seen_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS orbit_workers (
-                    worker_id TEXT PRIMARY KEY,
-                    runtime_name TEXT NOT NULL,
-                    host_id TEXT NOT NULL,
-                    model_id TEXT,
-                    capabilities_json TEXT NOT NULL,
-                    tool_allowlist_json TEXT NOT NULL,
-                    skills_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    transport TEXT NOT NULL,
-                    resources_json TEXT NOT NULL,
-                    endpoint TEXT,
-                    notes TEXT,
-                    registered_at REAL NOT NULL,
-                    last_heartbeat REAL NOT NULL,
-                    assigned_task_id TEXT
-                );
-                CREATE TABLE IF NOT EXISTS worker_tasks (
-                    task_id TEXT PRIMARY KEY,
-                    mission_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    capability_required TEXT NOT NULL,
-                    spec_json TEXT NOT NULL,
-                    grant_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    worker_id TEXT,
-                    attempt INTEGER NOT NULL DEFAULT 1,
-                    max_attempts INTEGER NOT NULL DEFAULT 3,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    result_json TEXT,
-                    cancel_reason TEXT
-                );
-                CREATE TABLE IF NOT EXISTS worker_leases (
-                    lease_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    mission_id TEXT NOT NULL,
-                    worker_id TEXT NOT NULL,
-                    acquired_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    status TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS worker_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    worker_id TEXT,
-                    task_id TEXT,
-                    kind TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-            """)
+        self.operator_token_path = Path(
+            operator_token_path or self.database.with_suffix(".operator.token")
+        )
+        self.operator_token = self._bootstrap_operator_token(operator_token)
+        import atexit
 
-    def log_event(self, kind: str, message: str, *, worker_id: str | None = None, task_id: str | None = None, now: float | None = None) -> None:
-        ts = time.time() if now is None else now
-        with self.connect() as db:
-            db.execute(
-                "INSERT INTO worker_events(worker_id, task_id, kind, message, created_at) VALUES(?,?,?,?,?)",
-                (worker_id, task_id, kind, message[:500], ts),
-            )
+        atexit.register(self.close)
 
-    def events(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM worker_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(r) for r in rows]
-
-    # --- Pairing & Token Lifecycle -----------------------------------------
-
-    def create_pairing_code(
-        self,
-        *,
-        allowed_runtime: str | None = None,
-        scopes: list[str] | None = None,
-        ttl: float | None = None,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        """Issue a short-lived single-use pairing code. Only its SHA-256 hash is persisted."""
-        ts = time.time() if now is None else now
-        expires = ts + (self.pairing_ttl if ttl is None else float(ttl))
-        raw_code = f"orb_pair_{secrets.token_urlsafe(18)}"
-        pairing_id = uuid.uuid4().hex
-        code_hash = _sha256_hex(raw_code)
-        hint = mask_secret(raw_code)
-        scope_list = scopes or ["worker:register", "worker:heartbeat", "worker:poll", "worker:claim", "worker:report"]
-        with self.connect() as db:
-            db.execute(
-                "INSERT INTO worker_pairings(pairing_id, code_sha256, code_hint, allowed_runtime, scopes_json, created_at, expires_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (pairing_id, code_hash, hint, allowed_runtime, json.dumps(scope_list), ts, expires),
-            )
-        self.log_event("pairing_issued", f"Issued pairing {pairing_id[:8]} ({hint}) runtime={allowed_runtime or '*'}", now=ts)
-        return {
-            "pairing_id": pairing_id,
-            "pairing_code": raw_code,
-            "code_hint": hint,
-            "allowed_runtime": allowed_runtime,
-            "scopes": scope_list,
-            "created_at": ts,
-            "expires_at": expires,
-        }
-
-    def revoke_pairing(self, pairing_id: str, *, now: float | None = None) -> bool:
-        ts = time.time() if now is None else now
-        with self.connect() as db:
-            cur = db.execute(
-                "UPDATE worker_pairings SET revoked_at=? WHERE pairing_id=? AND revoked_at IS NULL",
-                (ts, pairing_id),
-            )
-        if cur.rowcount:
-            self.log_event("pairing_revoked", f"Revoked pairing {pairing_id[:8]}", now=ts)
-            return True
-        return False
-
-    def revoke_worker_tokens(self, worker_id: str, *, now: float | None = None) -> int:
-        ts = time.time() if now is None else now
-        with self.connect() as db:
-            cur = db.execute(
-                "UPDATE worker_tokens SET revoked_at=? WHERE worker_id=? AND revoked_at IS NULL",
-                (ts, worker_id),
-            )
-            db.execute("UPDATE orbit_workers SET status='OFFLINE' WHERE worker_id=?", (worker_id,))
-        if cur.rowcount:
-            self.log_event("token_revoked", f"Revoked {cur.rowcount} token(s) for {worker_id}", worker_id=worker_id, now=ts)
-        return cur.rowcount
-
-    def _record_nonce(self, worker_id: str, nonce: str, ts: float) -> None:
-        if not nonce or len(nonce.strip()) < 6:
-            raise WorkerAuthError("Nonce must be at least 6 characters")
-        digest = _sha256_hex(f"{worker_id}:{nonce.strip()}")
-        with self.connect() as db:
-            existing = db.execute("SELECT nonce_sha256 FROM worker_nonces WHERE nonce_sha256=?", (digest,)).fetchone()
-            if existing:
-                self.log_event("replay_blocked", f"Blocked replayed nonce from {worker_id}", worker_id=worker_id, now=ts)
-                raise WorkerAuthError("Replay detected: nonce already used")
-            db.execute("INSERT INTO worker_nonces(nonce_sha256, worker_id, seen_at) VALUES(?,?,?)", (digest, worker_id, ts))
-
-    def register_worker(
-        self,
-        pairing_code: str,
-        manifest: WorkerManifest | dict[str, Any],
-        *,
-        nonce: str | None = None,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        """Authenticate a one-time pairing credential + nonce, register worker, and return a scoped bearer token."""
-        ts = time.time() if now is None else now
-        if isinstance(manifest, dict):
-            manifest = WorkerManifest.from_dict(manifest)
-
-        if manifest.status == "OFFLINE":
-            raise WorkerProtocolError(f"Runtime '{manifest.runtime_name}' is OFFLINE and cannot register as an active worker")
-
-        if not pairing_code or not isinstance(pairing_code, str):
-            raise WorkerAuthError("Missing pairing_code")
-
-        code_hash = _sha256_hex(pairing_code.strip())
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM worker_pairings WHERE code_sha256=?", (code_hash,)).fetchone()
-            if not row:
-                self.log_event("auth_failed", f"Invalid pairing code for {manifest.worker_id}", worker_id=manifest.worker_id, now=ts)
-                raise WorkerAuthError("Invalid pairing credential")
-            if row["revoked_at"] is not None:
-                self.log_event("auth_failed", f"Revoked pairing code used by {manifest.worker_id}", worker_id=manifest.worker_id, now=ts)
-                raise WorkerAuthError("Pairing credential has been revoked")
-            if row["used_at"] is not None:
-                self.log_event("replay_blocked", f"Replayed pairing code used by {manifest.worker_id}", worker_id=manifest.worker_id, now=ts)
-                raise WorkerAuthError("Pairing credential was already consumed (replay denied)")
-            if ts > float(row["expires_at"]):
-                self.log_event("auth_failed", f"Expired pairing code used by {manifest.worker_id}", worker_id=manifest.worker_id, now=ts)
-                raise WorkerAuthError("Pairing credential has expired")
-            if row["allowed_runtime"] and row["allowed_runtime"] != manifest.runtime_name:
-                raise WorkerAuthError(f"Pairing credential is scoped to runtime '{row['allowed_runtime']}', not '{manifest.runtime_name}'")
-
-        if nonce is not None:
-            self._record_nonce(manifest.worker_id, nonce, ts)
-
-        raw_token = f"orb_wt_{secrets.token_urlsafe(24)}"
-        token_hash = _sha256_hex(raw_token)
-        token_hint = mask_secret(raw_token)
-        token_id = uuid.uuid4().hex
-        token_expires = ts + self.token_ttl
-        scopes = json.loads(row["scopes_json"])
-
-        with self.connect() as db:
-            cur = db.execute(
-                "UPDATE worker_pairings SET used_at=?, used_by_worker_id=? WHERE pairing_id=? AND used_at IS NULL",
-                (ts, manifest.worker_id, row["pairing_id"]),
-            )
-            if cur.rowcount != 1:
-                raise WorkerAuthError("Pairing credential race detected")
-            db.execute(
-                "INSERT INTO worker_tokens(token_id, worker_id, token_sha256, token_hint, scopes_json, created_at, expires_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (token_id, manifest.worker_id, token_hash, token_hint, json.dumps(scopes), ts, token_expires),
-            )
-            db.execute(
+    def _bootstrap_operator_token(self, explicit_token: str | None) -> str:
+        env_token = os.environ.get("ORBIT_OPERATOR_TOKEN", "").strip()
+        env_file = os.environ.get("ORBIT_OPERATOR_TOKEN_FILE", "").strip()
+        token = explicit_token or env_token
+        if not token and env_file:
+            token = read_secret_file(Path(env_file))
+        if not token and self.operator_token_path.is_file():
+            try:
+                token = read_secret_file(self.operator_token_path)
+            except (PermissionError, OSError):
+                token = None
+        if not token:
+            token = f"orb_op_{secrets.token_urlsafe(32)}"
+            write_secret_file(self.operator_token_path, token + "\n")
+        else:
+            write_secret_file(self.operator_token_path, token + "\n")
+        with self._lock:
+            self._conn.execute(
                 """
-                INSERT INTO orbit_workers(
-                    worker_id, runtime_name, host_id, model_id, capabilities_json,
-                    tool_allowlist_json, skills_json, status, version, transport,
-                    resources_json, endpoint, notes, registered_at, last_heartbeat, assigned_task_id
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-                ON CONFLICT(worker_id) DO UPDATE SET
-                    runtime_name=excluded.runtime_name,
-                    host_id=excluded.host_id,
-                    model_id=excluded.model_id,
-                    capabilities_json=excluded.capabilities_json,
-                    tool_allowlist_json=excluded.tool_allowlist_json,
-                    skills_json=excluded.skills_json,
-                    status=excluded.status,
-                    version=excluded.version,
-                    transport=excluded.transport,
-                    resources_json=excluded.resources_json,
-                    endpoint=excluded.endpoint,
-                    notes=excluded.notes,
-                    last_heartbeat=excluded.last_heartbeat
+                INSERT INTO operator_tokens(token_hash, label, created_at, revoked_at)
+                VALUES (?, 'bootstrap', ?, NULL)
+                ON CONFLICT(token_hash) DO UPDATE SET revoked_at = NULL
                 """,
+                (digest(token), isoformat(self.now())),
+            )
+            self._conn.commit()
+        return token
+
+    def issue_operator_token(self, label: str = "operator") -> str:
+        with self._lock:
+            token = f"orb_op_{secrets.token_urlsafe(32)}"
+            self._conn.execute(
+                "INSERT INTO operator_tokens(token_hash, label, created_at, revoked_at) VALUES (?, ?, ?, NULL)",
+                (digest(token), label[:80], isoformat(self.now())),
+            )
+            self._conn.commit()
+            return token
+
+    def revoke_operator_token(self, token: str) -> None:
+        with self._lock:
+            updated = self._conn.execute(
+                "UPDATE operator_tokens SET revoked_at = ? WHERE token_hash = ?",
+                (isoformat(self.now()), digest(token)),
+            )
+            self._conn.commit()
+            if updated.rowcount == 0:
+                raise ProtocolError(404, "operator token not found")
+
+    def authenticate_operator(
+        self,
+        authorization: str | None,
+        operator_header: str | None = None,
+        headers: Any | None = None,
+    ) -> sqlite3.Row:
+        with self._lock:
+            if headers is not None:
+                for hdr in _FORWARDED_HEADERS:
+                    if headers.get(hdr):
+                        raise ProtocolError(403, "operator endpoints refuse forwarded requests")
+            raw_token: str | None = None
+            if operator_header and operator_header.strip():
+                raw_token = operator_header.strip()
+            elif authorization:
+                raw_token = _bearer(authorization)
+            if not raw_token or " " in raw_token:
+                raise ProtocolError(401, "operator credentials required")
+            token_hash = digest(raw_token)
+            worker_row = self._conn.execute(
+                "SELECT worker_id FROM workers WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if worker_row is not None:
+                raise ProtocolError(403, "worker credentials forbidden on operator endpoint")
+            op_row = self._conn.execute(
+                "SELECT * FROM operator_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if op_row is None or op_row["revoked_at"] is not None:
+                raise ProtocolError(401, "operator credentials rejected")
+            return op_row
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.close()
+            self._conn = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def now(self) -> datetime:
+        if self.clock is not None:
+            return self.clock.now()
+        return utcnow()
+
+    def create_pairing(self) -> dict[str, str]:
+        with self._lock:
+            code = secrets.token_hex(8)
+            expires = self.now() + timedelta(seconds=self.pairing_ttl)
+            self._conn.execute(
+                "INSERT INTO pairing(code_hash, expires_at, used_at) VALUES (?, ?, NULL)",
+                (digest(code), isoformat(expires)),
+            )
+            self._conn.commit()
+            return {"protocol": PROTOCOL, "pairing_code": code, "expires_at": isoformat(expires)}
+
+    def pair(self, request: PairRequest) -> dict[str, str]:
+        with self._lock:
+            try:
+                if request.protocol != PROTOCOL:
+                    raise ProtocolError(409, "protocol mismatch")
+                moment = self.now()
+                if self._failure_count(moment) >= self.failure_limit:
+                    raise ProtocolError(429, "too many pairing attempts")
+                row = self._conn.execute(
+                    "SELECT code_hash, expires_at, used_at FROM pairing WHERE code_hash = ?",
+                    (digest(request.pairing_code),),
+                ).fetchone()
+                if row is None or row["used_at"] is not None or parse_time(row["expires_at"]) <= moment:
+                    self._record_failure(moment)
+                    self._conn.commit()
+                    raise ProtocolError(401, "pairing code rejected")
+                token = secrets.token_urlsafe(32)
+                worker_id = request.manifest.worker_id
+                previous = self._conn.execute(
+                    "SELECT worker_id FROM workers WHERE worker_id = ?", (worker_id,)
+                ).fetchone()
+                self._upsert_worker(request.manifest, digest(token), moment)
+                self._conn.execute(
+                    "UPDATE pairing SET used_at = ? WHERE code_hash = ?",
+                    (isoformat(moment), digest(request.pairing_code)),
+                )
+                self._event(
+                    moment,
+                    worker_id,
+                    None,
+                    "paired" if previous is None else "token_rotated",
+                    "token stored as hash",
+                )
+                self._conn.commit()
+                return {
+                    "protocol": PROTOCOL,
+                    "worker_id": worker_id,
+                    "token_type": "Bearer",
+                    "token": token,
+                    "expires_at": isoformat(moment + timedelta(seconds=self.token_ttl)),
+                }
+            except ProtocolError:
+                raise
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def authenticate(
+        self,
+        authorization: str | None,
+        nonce: str | None,
+        timestamp: str | None,
+    ) -> sqlite3.Row:
+        with self._lock:
+            token = _bearer(authorization)
+            token_hash = digest(token)
+            op_row = self._conn.execute(
+                "SELECT token_hash FROM operator_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if op_row is not None:
+                raise ProtocolError(403, "operator credentials forbidden on worker endpoint")
+            moment = self.now()
+            row = self._conn.execute(
+                "SELECT * FROM workers WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+            if row is None or row["revoked_at"] is not None:
+                raise ProtocolError(401, "credentials rejected")
+            if parse_time(row["token_expires"]) <= moment:
+                raise ProtocolError(401, "credentials expired")
+            try:
+                stamp = int(timestamp or "")
+            except ValueError as exc:
+                raise ProtocolError(401, "timestamp rejected") from exc
+            skew = abs(stamp - int(moment.timestamp()))
+            if skew > self.timestamp_skew:
+                raise ProtocolError(401, "timestamp rejected")
+            checked_nonce = valid_nonce(nonce)
+            cutoff = isoformat(moment - timedelta(seconds=self.timestamp_skew * 2))
+            self._conn.execute("DELETE FROM nonces WHERE seen_at < ?", (cutoff,))
+            try:
+                self._conn.execute(
+                    "INSERT INTO nonces(token_hash, nonce, seen_at) VALUES (?, ?, ?)",
+                    (token_hash, checked_nonce, isoformat(moment)),
+                )
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                raise ProtocolError(409, "nonce replay") from exc
+            self._conn.commit()
+            return row
+
+    def heartbeat(self, worker: sqlite3.Row, manifest: Manifest) -> dict[str, Any]:
+        with self._lock:
+            self._require_same_worker(worker, manifest.worker_id)
+            moment = self.now()
+            self._sweep(moment)
+            self._write_manifest(manifest, moment)
+            self._extend_leases(manifest.worker_id, moment)
+            self._conn.commit()
+            fresh = self._conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (manifest.worker_id,)
+            ).fetchone()
+            return {
+                "ok": True,
+                "protocol": PROTOCOL,
+                "presence": self._presence(fresh, moment),
+                "server_time": isoformat(moment),
+                "cancels": self._cancel_ids(manifest.worker_id),
+            }
+
+    def poll(self, worker: sqlite3.Row) -> dict[str, Any]:
+        with self._lock:
+            moment = self.now()
+            self._sweep(moment)
+            existing = self._conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE worker_id = ? AND status IN ('leased', 'cancel_requested')
+                ORDER BY created_at LIMIT 1
+                """,
+                (worker["worker_id"],),
+            ).fetchone()
+            if existing is not None:
+                self._conn.commit()
+                return self._poll_body(worker["worker_id"], existing)
+            capabilities = set(json.loads(worker["capabilities_json"]))
+            queued = self._conn.execute(
+                "SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at, task_id"
+            ).fetchall()
+            chosen = None
+            for task in queued:
+                required = set(json.loads(task["required_json"]))
+                if required <= capabilities:
+                    if chosen is None:
+                        chosen = task
+                else:
+                    self._deny_once(moment, task, worker["worker_id"], required - capabilities)
+            if chosen is None:
+                self._conn.commit()
+                return self._poll_body(worker["worker_id"], None)
+            lease_id = uuid.uuid4().hex
+            expires = isoformat(moment + timedelta(seconds=self.lease_ttl))
+            updated = self._conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'leased', worker_id = ?, lease_id = ?, lease_expires = ?, updated_at = ?
+                WHERE task_id = ? AND status = 'queued'
+                """,
+                (worker["worker_id"], lease_id, expires, isoformat(moment), chosen["task_id"]),
+            )
+            if updated.rowcount != 1:
+                self._conn.commit()
+                return self._poll_body(worker["worker_id"], None)
+            self._event(moment, worker["worker_id"], chosen["task_id"], "leased", "single lease")
+            self._conn.commit()
+            leased = self._conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (chosen["task_id"],)
+            ).fetchone()
+            return self._poll_body(worker["worker_id"], leased)
+
+    def progress(self, worker: sqlite3.Row, task_id: str, body: ProgressRequest) -> dict[str, str]:
+        with self._lock:
+            task = self._owned_lease(worker, task_id, body.lease_id)
+            moment = self.now()
+            self._event(
+                moment,
+                worker["worker_id"],
+                task_id,
+                "progress",
+                scrub(body.message)[:400] or body.status,
+            )
+            self._conn.execute(
+                "UPDATE tasks SET updated_at = ?, lease_expires = ? WHERE task_id = ?",
                 (
-                    manifest.worker_id,
-                    manifest.runtime_name,
-                    manifest.host_id,
-                    manifest.model_id,
-                    json.dumps(list(manifest.capabilities)),
-                    json.dumps(list(manifest.tool_allowlist)),
-                    json.dumps(list(manifest.skills)),
-                    manifest.status,
-                    manifest.version,
-                    manifest.transport,
-                    json.dumps(manifest.resources),
-                    manifest.endpoint,
-                    manifest.notes,
-                    ts,
-                    ts,
+                    isoformat(moment),
+                    isoformat(moment + timedelta(seconds=self.lease_ttl)),
+                    task["task_id"],
                 ),
             )
+            self._conn.commit()
+            return {"ok": "true", "task_id": task_id}
 
-        self.log_event(
-            "worker_registered",
-            f"Registered worker {manifest.worker_id} (runtime={manifest.runtime_name}, host={manifest.host_id}, model={manifest.model_id or 'none'}, token={token_hint})",
-            worker_id=manifest.worker_id,
-            now=ts,
-        )
-        return {
-            "protocol_version": PROTOCOL_VERSION,
-            "worker_id": manifest.worker_id,
-            "id": manifest.worker_id,
-            "worker_token": raw_token,
-            "token": raw_token,
-            "token_hint": token_hint,
-            "scopes": scopes,
-            "expires_at": token_expires,
-            "heartbeat_ttl": self.heartbeat_ttl,
-            "worker": self.get_worker(manifest.worker_id, now=ts),
-        }
-
-    def authenticate_worker(
-        self,
-        token: str | None,
-        *,
-        expected_worker_id: str | None = None,
-        required_scope: str | None = None,
-        nonce: str | None = None,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        """Validate a worker bearer token, check expiry/revocation/scope, and enforce anti-replay nonce if provided."""
-        ts = time.time() if now is None else now
-        if not token or not isinstance(token, str):
-            raise WorkerAuthError("Missing worker authentication token")
-        clean = token.strip()
-        if clean.lower().startswith("bearer "):
-            clean = clean[7:].strip()
-        token_hash = _sha256_hex(clean)
-        with self.connect() as db:
-            trow = db.execute("SELECT * FROM worker_tokens WHERE token_sha256=?", (token_hash,)).fetchone()
-        if not trow:
-            raise WorkerAuthError("Invalid worker token")
-        if trow["revoked_at"] is not None:
-            raise WorkerAuthError("Worker token has been revoked")
-        if ts > float(trow["expires_at"]):
-            raise WorkerAuthError("Worker token has expired")
-        worker_id = trow["worker_id"]
-        if expected_worker_id and expected_worker_id != worker_id:
-            raise WorkerAuthError(f"Token belongs to '{worker_id}', not '{expected_worker_id}'")
-        scopes = json.loads(trow["scopes_json"] or "[]")
-        if required_scope and required_scope not in scopes:
-            raise WorkerAuthError(f"Worker token lacks required scope '{required_scope}'")
-        if nonce is not None:
-            self._record_nonce(worker_id, nonce, ts)
-        worker = self.get_worker(worker_id, now=ts)
-        if not worker:
-            raise WorkerAuthError("Worker record not found")
-        return worker
-
-    # --- Liveness & Heartbeat ----------------------------------------------
-
-    def age_workers_and_leases(self, *, now: float | None = None) -> None:
-        """Deterministically transition stale workers to OFFLINE and expire stale leases."""
-        ts = time.time() if now is None else now
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM orbit_workers WHERE status != 'OFFLINE'").fetchall()
-            for r in rows:
-                if ts - float(r["last_heartbeat"]) > self.heartbeat_ttl:
-                    wid = r["worker_id"]
-                    db.execute("UPDATE orbit_workers SET status='OFFLINE', assigned_task_id=NULL WHERE worker_id=?", (wid,))
-                    # Fail or requeue active leases held by lost worker
-                    active_leases = db.execute(
-                        "SELECT * FROM worker_leases WHERE worker_id=? AND status='ACTIVE'", (wid,)
-                    ).fetchall()
-                    for lease in active_leases:
-                        db.execute("UPDATE worker_leases SET status='EXPIRED' WHERE lease_id=?", (lease["lease_id"],))
-                        db.execute(
-                            "UPDATE worker_tasks SET status='PENDING', worker_id=NULL, updated_at=? "
-                            "WHERE task_id=? AND status IN ('ASSIGNED', 'RUNNING')",
-                            (ts, lease["task_id"]),
-                        )
-                    db.execute(
-                        "INSERT INTO worker_events(worker_id, task_id, kind, message, created_at) VALUES(?,?,?,?,?)",
-                        (wid, None, "heartbeat_lost", f"Worker {wid} exceeded heartbeat TTL ({self.heartbeat_ttl:.0f}s) -> OFFLINE", ts),
-                    )
-
-            expired = db.execute(
-                "SELECT * FROM worker_leases WHERE status='ACTIVE' AND expires_at < ?", (ts,)
-            ).fetchall()
-            for lease in expired:
-                db.execute("UPDATE worker_leases SET status='EXPIRED' WHERE lease_id=?", (lease["lease_id"],))
-                db.execute(
-                    "UPDATE worker_tasks SET status='PENDING', worker_id=NULL, updated_at=? "
-                    "WHERE task_id=? AND status IN ('ASSIGNED', 'RUNNING')",
-                    (ts, lease["task_id"]),
-                )
-
-    def heartbeat(
-        self,
-        worker_id: str,
-        *,
-        status: str | None = None,
-        model_id: str | None = None,
-        resources: dict[str, Any] | None = None,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        ts = time.time() if now is None else now
-        self.age_workers_and_leases(now=ts)
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM orbit_workers WHERE worker_id=?", (worker_id,)).fetchone()
-            if not row:
-                raise WorkerProtocolError(f"Unknown worker: {worker_id}")
-            new_status = (status or row["status"] or "IDLE").upper()
-            if new_status not in WORKER_STATES:
-                raise WorkerProtocolError(f"Invalid status: {new_status}")
-            if new_status == "OFFLINE":
-                new_status = "IDLE"
-            new_model = model_id if model_id is not None else row["model_id"]
-            new_res = json.dumps(resources) if resources is not None else row["resources_json"]
-            db.execute(
-                "UPDATE orbit_workers SET status=?, model_id=?, resources_json=?, last_heartbeat=? WHERE worker_id=?",
-                (new_status, new_model, new_res, ts, worker_id),
-            )
-            # Extend any active lease held by this worker
-            db.execute(
-                "UPDATE worker_leases SET expires_at=? WHERE worker_id=? AND status='ACTIVE'",
-                (ts + self.lease_ttl, worker_id),
-            )
-            cancelled_rows = db.execute(
-                "SELECT task_id, cancel_reason, updated_at FROM worker_tasks WHERE worker_id=? AND status='CANCELLED'",
-                (worker_id,),
-            ).fetchall()
-
-        cancellations = [
-            Cancel(task_id=r["task_id"], lease_id=None, reason=r["cancel_reason"] or "Cancelled", cancelled_at=r["updated_at"]).to_dict()
-            for r in cancelled_rows
-        ]
-        return {
-            "status": "ok",
-            "worker": self.get_worker(worker_id, now=ts),
-            "cancellations": cancellations,
-            "server_time": ts,
-        }
-
-    def get_worker(self, worker_id: str, *, now: float | None = None) -> dict[str, Any] | None:
-        self.age_workers_and_leases(now=now)
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM orbit_workers WHERE worker_id=?", (worker_id,)).fetchone()
-        return self._format_worker_row(row) if row else None
-
-    def list_workers(self, *, now: float | None = None) -> list[dict[str, Any]]:
-        self.age_workers_and_leases(now=now)
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM orbit_workers ORDER BY registered_at ASC").fetchall()
-        return [self._format_worker_row(r) for r in rows]
-
-    @staticmethod
-    def _format_worker_row(row: sqlite3.Row) -> dict[str, Any]:
-        d = dict(row)
-        caps = json.loads(d.pop("capabilities_json") or "[]")
-        tools = json.loads(d.pop("tool_allowlist_json") or "[]")
-        skills = json.loads(d.pop("skills_json") or "[]")
-        resources = json.loads(d.pop("resources_json") or "{}")
-        return {
-            "worker_id": d["worker_id"],
-            "id": d["worker_id"],
-            "name": d["worker_id"],
-            "runtime_name": d["runtime_name"],
-            "kind": d["runtime_name"],
-            "host_id": d["host_id"],
-            "host": d["host_id"],
-            "model_id": d["model_id"],
-            "capabilities": caps,
-            "tool_allowlist": tools,
-            "skills": skills,
-            "skill_count": len(skills),
-            "status": d["status"],
-            "version": d["version"],
-            "transport": d["transport"],
-            "resources": resources,
-            "endpoint": d["endpoint"],
-            "notes": d["notes"],
-            "registered_at": d["registered_at"],
-            "last_heartbeat": d["last_heartbeat"],
-            "assigned_task_id": d["assigned_task_id"],
-        }
-
-    # --- Task Creation, Polling, Leasing, Progress, Verification, Cancellation ---
-
-    def enqueue_task(
-        self,
-        title: str,
-        spec: dict[str, Any],
-        *,
-        mission_id: str = "mission-local",
-        capability_required: str = "orbit.plan.deliver",
-        grant: dict[str, Any] | None = None,
-        max_attempts: int = 3,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        ts = time.time() if now is None else now
-        task_id = uuid.uuid4().hex
-        grant_obj = grant or {"root": str(self.default_workspace), "denied_paths": []}
-        with self.connect() as db:
-            db.execute(
+    def result(self, worker: sqlite3.Row, task_id: str, body: ResultRequest) -> dict[str, str]:
+        with self._lock:
+            task = self._owned_lease(worker, task_id, body.lease_id)
+            if task["status"] == "cancel_requested" and body.status != "cancelled":
+                raise ProtocolError(409, "task is cancel requested")
+            moment = self.now()
+            result_json = bounded_json(body.result)
+            excerpt = scrub(body.log_excerpt)[:2000]
+            self._conn.execute(
                 """
-                INSERT INTO worker_tasks(
-                    task_id, mission_id, title, capability_required, spec_json,
-                    grant_json, status, worker_id, attempt, max_attempts, created_at, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,1,?,?,?)
+                UPDATE tasks
+                SET status = ?, result_json = ?, log_excerpt = ?, updated_at = ?,
+                    lease_id = NULL, lease_expires = NULL
+                WHERE task_id = ?
+                """,
+                (body.status, result_json, excerpt, isoformat(moment), task_id),
+            )
+            self._event(moment, worker["worker_id"], task_id, "result", body.status)
+            self._conn.commit()
+            return {"ok": "true", "task_id": task_id, "status": body.status}
+
+    def enqueue(self, body: TaskCreate) -> dict[str, Any]:
+        with self._lock:
+            moment = self.now()
+            task_id = body.task_id or uuid.uuid4().hex
+            if self._conn.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone():
+                raise ProtocolError(409, "task id already exists")
+            required = body.required_capabilities or [body.task_type]
+            payload = bounded_json(body.payload)
+            self._conn.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, task_type, payload_json, required_json, grant_name, status,
+                    worker_id, lease_id, lease_expires, result_json, log_excerpt, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, '', ?, ?)
                 """,
                 (
                     task_id,
-                    mission_id,
-                    title[:160],
-                    capability_required,
-                    json.dumps(spec),
-                    json.dumps(grant_obj),
-                    "PENDING",
-                    None,
-                    max_attempts,
-                    ts,
-                    ts,
+                    body.task_type,
+                    payload,
+                    json.dumps(required),
+                    body.grant,
+                    isoformat(moment),
+                    isoformat(moment),
                 ),
             )
-        self.log_event("task_enqueued", f"Enqueued task '{title}' ({task_id[:8]}) cap={capability_required}", task_id=task_id, now=ts)
-        return self.get_task(task_id)
-
-    def get_task(self, task_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM worker_tasks WHERE task_id=?", (task_id,)).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        d["id"] = d["task_id"]
-        d["spec"] = json.loads(d.pop("spec_json") or "{}")
-        d["grant"] = json.loads(d.pop("grant_json") or "{}")
-        d["result"] = json.loads(d.pop("result_json")) if d.get("result_json") else None
-        return d
-
-    def list_tasks(self, mission_id: str | None = None) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            if mission_id:
-                rows = db.execute("SELECT task_id FROM worker_tasks WHERE mission_id=? ORDER BY created_at ASC", (mission_id,)).fetchall()
-            else:
-                rows = db.execute("SELECT task_id FROM worker_tasks ORDER BY created_at ASC").fetchall()
-        return [t for r in rows if (t := self.get_task(r["task_id"])) is not None]
-
-    def poll_tasks(self, worker_id: str, *, now: float | None = None) -> list[dict[str, Any]]:
-        """Return tasks eligible for `worker_id` based on its declared capabilities."""
-        ts = time.time() if now is None else now
-        self.age_workers_and_leases(now=ts)
-        worker = self.get_worker(worker_id, now=ts)
-        if not worker or worker["status"] == "OFFLINE":
-            raise WorkerProtocolError(f"Worker {worker_id} is not online")
-        caps = set(worker["capabilities"])
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT task_id FROM worker_tasks WHERE status IN ('PENDING', 'ASSIGNED') "
-                "AND (worker_id IS NULL OR worker_id=?) ORDER BY created_at ASC",
-                (worker_id,),
-            ).fetchall()
-        offers: list[dict[str, Any]] = []
-        for r in rows:
-            t = self.get_task(r["task_id"])
-            if not t:
-                continue
-            if t["capability_required"] not in caps:
-                continue
-            offers.append(
-                TaskOffer(
-                    task_id=t["task_id"],
-                    mission_id=t["mission_id"],
-                    title=t["title"],
-                    capability_required=t["capability_required"],
-                    spec=t["spec"],
-                    grant=t["grant"],
-                    attempt=t["attempt"],
-                    created_at=t["created_at"],
-                ).to_dict()
-            )
-        return offers
-
-    def claim_task(self, task_id: str, worker_id: str, *, now: float | None = None) -> dict[str, Any]:
-        """Atomically grant an exclusive Lease on `task_id` to `worker_id`. Prevents duplicate leases."""
-        ts = time.time() if now is None else now
-        self.age_workers_and_leases(now=ts)
-        worker = self.get_worker(worker_id, now=ts)
-        if not worker or worker["status"] == "OFFLINE":
-            raise WorkerProtocolError(f"Worker {worker_id} is not online")
-
-        with self.connect() as db:
-            trow = db.execute("SELECT * FROM worker_tasks WHERE task_id=?", (task_id,)).fetchone()
-            if not trow:
-                raise WorkerProtocolError(f"Task not found: {task_id}")
-            if trow["capability_required"] not in set(worker["capabilities"]):
-                raise WorkerProtocolError(
-                    f"Worker {worker_id} lacks required capability '{trow['capability_required']}'"
-                )
-            # Check if an active lease already exists
-            active_lease = db.execute(
-                "SELECT * FROM worker_leases WHERE task_id=? AND status='ACTIVE'", (task_id,)
-            ).fetchone()
-            if active_lease:
-                if active_lease["worker_id"] == worker_id:
-                    # Idempotent re-claim by the same worker
-                    return {
-                        "lease": Lease(
-                            lease_id=active_lease["lease_id"],
-                            task_id=task_id,
-                            mission_id=trow["mission_id"],
-                            worker_id=worker_id,
-                            acquired_at=active_lease["acquired_at"],
-                            expires_at=active_lease["expires_at"],
-                            status="ACTIVE",
-                        ).to_dict(),
-                        "task": self.get_task(task_id),
-                    }
-                raise WorkerProtocolError(f"Task {task_id} is already leased to worker '{active_lease['worker_id']}'")
-
-            if trow["status"] not in ("PENDING", "ASSIGNED"):
-                raise WorkerProtocolError(f"Task {task_id} is in state '{trow['status']}' and cannot be claimed")
-            if trow["worker_id"] and trow["worker_id"] != worker_id:
-                raise WorkerProtocolError(f"Task {task_id} is assigned to another worker '{trow['worker_id']}'")
-
-            lease_id = uuid.uuid4().hex
-            expires_at = ts + self.lease_ttl
-            cur = db.execute(
-                "UPDATE worker_tasks SET status='RUNNING', worker_id=?, updated_at=? "
-                "WHERE task_id=? AND status IN ('PENDING', 'ASSIGNED')",
-                (worker_id, ts, task_id),
-            )
-            if cur.rowcount != 1:
-                raise WorkerProtocolError("Concurrent claim conflict")
-            db.execute(
-                "INSERT INTO worker_leases(lease_id, task_id, mission_id, worker_id, acquired_at, expires_at, status) "
-                "VALUES(?,?,?,?,?,?,'ACTIVE')",
-                (lease_id, task_id, trow["mission_id"], worker_id, ts, expires_at),
-            )
-            db.execute(
-                "UPDATE orbit_workers SET status='BUSY', assigned_task_id=?, last_heartbeat=? WHERE worker_id=?",
-                (task_id, ts, worker_id),
-            )
-
-        self.log_event("task_claimed", f"Worker {worker_id} claimed task {task_id[:8]} (lease {lease_id[:8]})", worker_id=worker_id, task_id=task_id, now=ts)
-        return {
-            "lease": Lease(
-                lease_id=lease_id,
-                task_id=task_id,
-                mission_id=trow["mission_id"],
-                worker_id=worker_id,
-                acquired_at=ts,
-                expires_at=expires_at,
-                status="ACTIVE",
-            ).to_dict(),
-            "task": self.get_task(task_id),
-        }
-
-    def record_progress(self, progress: TaskProgress | dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
-        ts = time.time() if now is None else now
-        if isinstance(progress, dict):
-            progress = TaskProgress(
-                task_id=str(progress["task_id"]),
-                lease_id=str(progress.get("lease_id") or ""),
-                worker_id=str(progress["worker_id"]),
-                stage=str(progress.get("stage") or "RUN"),
-                percent=max(0, min(100, int(progress.get("percent") or 0))),
-                message=str(progress.get("message") or "")[:300],
-                timestamp=ts,
-            )
-        with self.connect() as db:
-            trow = db.execute("SELECT * FROM worker_tasks WHERE task_id=?", (progress.task_id,)).fetchone()
-            if not trow:
-                raise WorkerProtocolError(f"Task not found: {progress.task_id}")
-            if trow["status"] == "CANCELLED":
-                return {
-                    "status": "cancelled",
-                    "cancel": Cancel(
-                        task_id=progress.task_id,
-                        lease_id=progress.lease_id or None,
-                        reason=trow["cancel_reason"] or "Task cancelled",
-                        cancelled_at=trow["updated_at"],
-                    ).to_dict(),
-                }
-            if trow["worker_id"] != progress.worker_id:
-                raise WorkerProtocolError("Progress worker_id does not match task owner")
-            db.execute("UPDATE orbit_workers SET last_heartbeat=? WHERE worker_id=?", (ts, progress.worker_id))
-            if progress.lease_id:
-                db.execute(
-                    "UPDATE worker_leases SET expires_at=? WHERE lease_id=? AND status='ACTIVE'",
-                    (ts + self.lease_ttl, progress.lease_id),
-                )
-
-        self.log_event(
-            "task_progress",
-            f"[{progress.percent}%] {progress.stage}: {progress.message}",
-            worker_id=progress.worker_id,
-            task_id=progress.task_id,
-            now=ts,
-        )
-        return {"status": "ok", "cancel": None}
-
-    def cancel_task(self, task_id: str, *, reason: str = "Cancelled by coordinator", now: float | None = None) -> dict[str, Any]:
-        ts = time.time() if now is None else now
-        with self.connect() as db:
-            trow = db.execute("SELECT * FROM worker_tasks WHERE task_id=?", (task_id,)).fetchone()
-            if not trow:
-                raise WorkerProtocolError(f"Task not found: {task_id}")
-            wid = trow["worker_id"]
-            db.execute(
-                "UPDATE worker_tasks SET status='CANCELLED', cancel_reason=?, updated_at=? WHERE task_id=?",
-                (reason[:300], ts, task_id),
-            )
-            db.execute(
-                "UPDATE worker_leases SET status='CANCELLED' WHERE task_id=? AND status='ACTIVE'",
-                (task_id,),
-            )
-            if wid:
-                db.execute(
-                    "UPDATE orbit_workers SET status='IDLE', assigned_task_id=NULL WHERE worker_id=? AND assigned_task_id=?",
-                    (wid, task_id),
-                )
-        self.log_event("task_cancelled", f"Cancelled task {task_id[:8]}: {reason}", worker_id=wid, task_id=task_id, now=ts)
-        return Cancel(task_id=task_id, lease_id=None, reason=reason, cancelled_at=ts).to_dict()
-
-    def _verify_task_artifacts(self, task: dict[str, Any]) -> tuple[bool, str]:
-        """Server-side verification of task output against workspace files (never trusts worker text alone)."""
-        spec = task["spec"]
-        grant = task["grant"]
-        root = Path(grant.get("root") or self.default_workspace).resolve()
-        denied = [str(p).rstrip("/") for p in (grant.get("denied_paths") or [])]
-        op = str(spec.get("op") or "deliver")
-        rel_path = str(spec.get("path") or "").strip()
-
-        if rel_path:
-            for d in denied:
-                if rel_path == d or rel_path.startswith(d + "/"):
-                    return False, f"GRANT DENIED: '{rel_path}' is in denied_paths"
-            try:
-                target = checked_path(root, rel_path)
-            except (PermissionError, ValueError) as exc:
-                return False, f"PATH REJECTED: {exc}"
-        else:
-            target = root
-
-        if op in ("deliver", "retry-deliver", "workspace.write_scoped"):
-            if not target.is_file():
-                return False, f"MISSING ARTIFACT: {rel_path}"
-            data = target.read_bytes()
-            text = data.decode("utf-8", errors="replace")
-            for needle in spec.get("must_contain") or []:
-                if str(needle) not in text:
-                    return False, f"CONTENT MISMATCH: {rel_path} missing required string {needle!r}"
-            expected_sha = spec.get("expected_sha256")
-            actual_sha = hashlib.sha256(data).hexdigest()
-            if expected_sha and actual_sha != str(expected_sha).lower():
-                return False, f"SHA256 MISMATCH: expected {expected_sha[:12]}..., got {actual_sha[:12]}..."
-            return True, f"VERIFIED FILE: {rel_path} (sha256={actual_sha[:16]}..., {len(data)} bytes)"
-
-        if op in ("inspect", "workspace.inspect"):
-            if not target.exists():
-                return False, f"MISSING TARGET: {rel_path}"
-            return True, f"VERIFIED INSPECT: {rel_path or '.'} exists under {root.name}"
-
-        if op in ("read", "workspace.read"):
-            if not target.is_file():
-                return False, f"MISSING FILE: {rel_path}"
-            return True, f"VERIFIED READ: {rel_path} ({target.stat().st_size} bytes)"
-
-        return False, f"UNSUPPORTED TASK OP: {op}"
-
-    def report_result(
-        self,
-        result: TaskResult | dict[str, Any],
-        *,
-        worker_id: str | None = None,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        """Record worker submission and run independent server-side artifact verification."""
-        ts = time.time() if now is None else now
-        if isinstance(result, dict):
-            wid = str(worker_id or result.get("worker_id") or "")
-            raw_artifacts = result.get("artifacts") or []
-            norm_artifacts = [
-                {"path": a} if isinstance(a, str) else dict(a)
-                for a in raw_artifacts
-                if isinstance(a, (str, dict))
-            ]
-            result = TaskResult(
-                task_id=str(result.get("task_id") or ""),
-                lease_id=str(result.get("lease_id") or ""),
-                worker_id=wid,
-                status=str(result.get("status") or "SUBMITTED").upper(),
-                summary=str(result.get("summary") or result.get("notes") or "submitted"),
-                artifacts=norm_artifacts,
-                logs=list(result.get("logs") or []),
-                completed_at=ts,
-            )
-
-        with self.connect() as db:
-            trow = db.execute("SELECT * FROM worker_tasks WHERE task_id=?", (result.task_id,)).fetchone()
-            if not trow:
-                raise WorkerProtocolError(f"Task not found: {result.task_id}")
-            if trow["status"] == "CANCELLED":
-                raise WorkerCancelledError(f"Task {result.task_id} was cancelled and cannot accept results")
-            if trow["worker_id"] != result.worker_id:
-                raise WorkerProtocolError(f"Task {result.task_id} is assigned to '{trow['worker_id']}', not '{result.worker_id}'")
-            if trow["status"] not in ("RUNNING", "SUBMITTED"):
-                raise WorkerProtocolError(f"Task {result.task_id} is in state '{trow['status']}', not RUNNING")
-
-            if result.lease_id:
-                lrow = db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (result.lease_id,)).fetchone()
-                if not lrow or lrow["status"] != "ACTIVE":
-                    raise WorkerProtocolError("Lease is no longer active")
-
-        task_dict = self.get_task(result.task_id)
-        assert task_dict is not None
-
-        if result.status in ("BLOCKED",):
-            final_status = "BLOCKED"
-            verify_msg = result.summary
-        elif result.status in ("FAILED", "DEGRADED"):
-            final_status = "FAILED"
-            verify_msg = result.summary
-        else:
-            ok, verify_msg = self._verify_task_artifacts(task_dict)
-            final_status = "VERIFIED" if ok else "FAILED"
-
-        payload_json = json.dumps({
-            **result.to_dict(),
-            "verified": final_status == "VERIFIED",
-            "verification_evidence": verify_msg,
-        })
-
-        with self.connect() as db:
-            db.execute(
-                "UPDATE worker_tasks SET status=?, result_json=?, updated_at=? WHERE task_id=?",
-                (final_status, payload_json, ts, result.task_id),
-            )
-            db.execute(
-                "UPDATE worker_leases SET status=? WHERE task_id=? AND status='ACTIVE'",
-                ("COMPLETED" if final_status == "VERIFIED" else "FAILED", result.task_id),
-            )
-            next_worker_status = "DEGRADED" if result.status == "DEGRADED" else "IDLE"
-            db.execute(
-                "UPDATE orbit_workers SET status=?, assigned_task_id=NULL, last_heartbeat=? WHERE worker_id=?",
-                (next_worker_status, ts, result.worker_id),
-            )
-
-        self.log_event(
-            "task_reported",
-            f"Task {result.task_id[:8]} -> {final_status}: {verify_msg}",
-            worker_id=result.worker_id,
-            task_id=result.task_id,
-            now=ts,
-        )
-        return self.get_task(result.task_id)  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# FastAPI Router for ORBIT Worker API v0.1
-# ---------------------------------------------------------------------------
-
-class PairingCreateRequest(BaseModel):
-    allowed_runtime: str | None = None
-    scopes: list[str] | None = None
-    ttl: float = Field(default=DEFAULT_PAIRING_TTL, ge=5.0, le=3600.0)
-
-
-class RegisterRequest(BaseModel):
-    pairing_code: str = Field(min_length=6, max_length=200)
-    nonce: str | None = Field(default=None, max_length=120)
-    manifest: dict[str, Any] | None = None
-    # Compatibility fields for flat registration payloads
-    worker_id: str | None = None
-    name: str | None = None
-    runtime_name: str | None = None
-    kind: str | None = None
-    host_id: str | None = None
-    host: str | None = None
-    model_id: str | None = None
-    capabilities: list[str] | None = None
-    tool_allowlist: list[str] | None = None
-    skills: list[str] | None = None
-    status: str = "IDLE"
-    version: str = "0.1.0"
-
-
-class HeartbeatRequest(BaseModel):
-    worker_id: str | None = None
-    worker_token: str | None = None
-    status: str | None = None
-    model_id: str | None = None
-    resources: dict[str, Any] | None = None
-
-
-class PollRequest(BaseModel):
-    worker_id: str | None = None
-    worker_token: str | None = None
-
-
-class ClaimRequest(BaseModel):
-    task_id: str | None = None
-    worker_id: str | None = None
-    worker_token: str | None = None
-
-
-class ProgressRequest(BaseModel):
-    task_id: str
-    lease_id: str = ""
-    worker_id: str | None = None
-    worker_token: str | None = None
-    stage: str = "RUN"
-    percent: int = Field(default=50, ge=0, le=100)
-    message: str = Field(default="working", max_length=300)
-
-
-class ReportRequest(BaseModel):
-    task_id: str | None = None
-    lease_id: str = ""
-    worker_id: str | None = None
-    worker_token: str | None = None
-    status: str = "SUBMITTED"
-    summary: str = ""
-    notes: str = ""
-    artifacts: list[Any] = Field(default_factory=list)
-    artifact_details: list[dict[str, Any]] = Field(default_factory=list)
-    logs: list[str] = Field(default_factory=list)
-
-
-class RevokeRequest(BaseModel):
-    worker_id: str | None = None
-    pairing_id: str | None = None
-    worker_token: str | None = None
-
-
-class EnqueueTaskRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=160)
-    mission_id: str = "mission-local"
-    capability_required: str = "orbit.plan.deliver"
-    spec: dict[str, Any]
-    grant: dict[str, Any] | None = None
-
-
-class CancelTaskRequest(BaseModel):
-    task_id: str
-    reason: str = "Cancelled by operator"
-
-
-def _extract_token(authorization: str | None, x_worker_token: str | None, body_token: str | None = None) -> str | None:
-    if x_worker_token:
-        return x_worker_token
-    if authorization:
-        return authorization
-    return body_token
-
-
-def create_worker_router(coordinator: LocalWorkerCoordinator) -> APIRouter:
-    """Create the versioned `/api/workers/v0.1` FastAPI router."""
-    router = APIRouter()
-
-    @router.get("/fleet")
-    @router.get("")
-    def get_fleet():
-        return {
-            "protocol_version": PROTOCOL_VERSION,
-            "workers": coordinator.list_workers(),
-            "tasks": coordinator.list_tasks(),
-            "events": coordinator.events(limit=50),
-        }
-
-    @router.post("/pairings", status_code=201)
-    def issue_pairing(payload: PairingCreateRequest):
-        return coordinator.create_pairing_code(
-            allowed_runtime=payload.allowed_runtime,
-            scopes=payload.scopes,
-            ttl=payload.ttl,
-        )
-
-    @router.post("/revoke")
-    @router.post("/unregister")
-    def revoke_credentials(
-        payload: RevokeRequest,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-    ):
-        revoked_tokens = 0
-        revoked_pairing = False
-        tok = _extract_token(authorization, x_orbit_worker_token, payload.worker_token)
-        if tok and not payload.worker_id:
-            try:
-                w = coordinator.authenticate_worker(tok)
-                revoked_tokens = coordinator.revoke_worker_tokens(w["worker_id"])
-            except WorkerAuthError:
-                pass
-        if payload.worker_id:
-            revoked_tokens = coordinator.revoke_worker_tokens(payload.worker_id)
-        if payload.pairing_id:
-            revoked_pairing = coordinator.revoke_pairing(payload.pairing_id)
-        return {"revoked": bool(revoked_tokens or revoked_pairing), "revoked_tokens": revoked_tokens, "revoked_pairing": revoked_pairing}
-
-    @router.post("/register", status_code=201)
-    def register(payload: RegisterRequest, x_orbit_nonce: str | None = Header(default=None)):
-        try:
-            manifest_dict = payload.manifest or {
-                "worker_id": payload.worker_id or payload.name or f"worker-{uuid.uuid4().hex[:8]}",
-                "runtime_name": payload.runtime_name or payload.kind or "antigravity",
-                "host_id": payload.host_id or payload.host or socket.gethostname(),
-                "model_id": payload.model_id,
-                "capabilities": payload.capabilities or ["orbit.plan.deliver"],
-                "tool_allowlist": payload.tool_allowlist or [],
-                "skills": payload.skills or [],
-                "status": payload.status,
-                "version": payload.version,
+            self._event(moment, None, task_id, "queued", body.task_type)
+            self._conn.commit()
+            return {
+                "protocol": PROTOCOL,
+                "task_id": task_id,
+                "status": "queued",
+                "required_capabilities": required,
             }
-            return coordinator.register_worker(
-                payload.pairing_code,
-                manifest_dict,
-                nonce=payload.nonce or x_orbit_nonce,
+
+    def cancel(self, task_id: str) -> dict[str, str]:
+        with self._lock:
+            task = self._conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if task is None:
+                raise ProtocolError(404, "task not found")
+            moment = self.now()
+            if task["status"] in TERMINAL_TASK_STATUSES:
+                raise ProtocolError(409, "task already finished")
+            if task["status"] == "queued":
+                self._conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE task_id = ?",
+                    (isoformat(moment), task_id),
+                )
+                self._event(moment, None, task_id, "cancelled", "cancelled before lease")
+                status = "cancelled"
+            else:
+                self._conn.execute(
+                    "UPDATE tasks SET status = 'cancel_requested', updated_at = ? WHERE task_id = ?",
+                    (isoformat(moment), task_id),
+                )
+                self._event(moment, task["worker_id"], task_id, "cancel_requested", "waiting for worker")
+                status = "cancel_requested"
+            self._conn.commit()
+            return {"ok": "true", "task_id": task_id, "status": status}
+
+    def revoke(self, worker_id: str) -> dict[str, str]:
+        with self._lock:
+            moment = self.now()
+            row = self._conn.execute(
+                "SELECT worker_id FROM workers WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            if row is None:
+                raise ProtocolError(404, "worker not found")
+            self._conn.execute(
+                "UPDATE workers SET revoked_at = ?, status = 'OFFLINE' WHERE worker_id = ?",
+                (isoformat(moment), worker_id),
             )
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except (WorkerProtocolError, ValueError) as exc:
-            raise HTTPException(400, str(exc)) from exc
+            self._release_worker_tasks(worker_id, moment)
+            self._event(moment, worker_id, None, "revoked", "token rejected from now")
+            self._conn.commit()
+            return {"ok": "true", "worker_id": worker_id, "presence": "OFFLINE"}
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            moment = self.now()
+            self._sweep(moment)
+            self._conn.commit()
+            workers = [
+                self._public_worker(row, moment)
+                for row in self._conn.execute("SELECT * FROM workers ORDER BY worker_id")
+            ]
+            tasks = [
+                self._public_task(row)
+                for row in self._conn.execute("SELECT * FROM tasks ORDER BY created_at, task_id")
+            ]
+            events = [
+                {
+                    "ts": row["ts"],
+                    "worker_id": row["worker_id"],
+                    "task_id": row["task_id"],
+                    "kind": row["kind"],
+                }
+                for row in self._conn.execute(
+                    "SELECT ts, worker_id, task_id, kind FROM events ORDER BY id DESC LIMIT 30"
+                )
+            ]
+            return {
+                "protocol": PROTOCOL,
+                "server_time": isoformat(moment),
+                "workers": workers,
+                "tasks": tasks,
+                "events": events,
+            }
+
+    def discovery_snapshot(self) -> dict[str, Any]:
+        """Return local host runtime discovery correlated with live paired workers.
+
+        Never reports a discovered runtime as `connected` or `authorized_to_execute`
+        unless a non-revoked worker for that runtime has `presence == 'LIVE'`.
+        """
+        snap = self.snapshot()
+        live_by_runtime: dict[str, list[dict[str, Any]]] = {}
+        for w in snap["workers"]:
+            if w.get("presence") == "LIVE" and not w.get("revoked"):
+                live_by_runtime.setdefault(w["runtime_name"], []).append(w)
+
+        ag_manifest = inspect_antigravity_runtime()
+        hermes_probe = inspect_hermes_runtime()
+        opencode_probe = inspect_opencode_runtime()
+        luna_probe = inspect_luna_runtime()
+
+        runtimes: dict[str, dict[str, Any]] = {
+            "antigravity": {
+                "runtime_name": "antigravity",
+                "discovered": ag_manifest.discovered,
+                "probe_status": "OBSERVED_LOCAL" if ag_manifest.discovered else "OFFLINE",
+                "connected": bool(live_by_runtime.get("antigravity")),
+                "authorized_to_execute": bool(live_by_runtime.get("antigravity")),
+                "registered_workers": [w["worker_id"] for w in live_by_runtime.get("antigravity", [])],
+                "executable_capabilities": (
+                    live_by_runtime["antigravity"][0]["capabilities"]
+                    if live_by_runtime.get("antigravity")
+                    else []
+                ),
+                "observed_session_tools_executable_through_orbit": False,
+            },
+            "hermes": {
+                **hermes_probe,
+                "connected": bool(live_by_runtime.get("hermes")),
+                "authorized_to_execute": bool(live_by_runtime.get("hermes")),
+                "registered_workers": [w["worker_id"] for w in live_by_runtime.get("hermes", [])],
+                "executable_capabilities": (
+                    live_by_runtime["hermes"][0]["capabilities"]
+                    if live_by_runtime.get("hermes")
+                    else []
+                ),
+            },
+            "opencode": {
+                **opencode_probe,
+                "connected": bool(live_by_runtime.get("opencode")),
+                "authorized_to_execute": bool(live_by_runtime.get("opencode")),
+                "registered_workers": [w["worker_id"] for w in live_by_runtime.get("opencode", [])],
+                "executable_capabilities": (
+                    live_by_runtime["opencode"][0]["capabilities"]
+                    if live_by_runtime.get("opencode")
+                    else []
+                ),
+            },
+            "luna": {
+                **luna_probe,
+                "connected": bool(live_by_runtime.get("luna")),
+                "authorized_to_execute": bool(live_by_runtime.get("luna")),
+                "registered_workers": [w["worker_id"] for w in live_by_runtime.get("luna", [])],
+                "executable_capabilities": (
+                    live_by_runtime["luna"][0]["capabilities"]
+                    if live_by_runtime.get("luna")
+                    else []
+                ),
+            },
+        }
+        for rt_name, workers_list in live_by_runtime.items():
+            if rt_name not in runtimes:
+                runtimes[rt_name] = {
+                    "runtime_name": rt_name,
+                    "discovered": True,
+                    "probe_status": "CONNECTED_WORKER",
+                    "connected": True,
+                    "authorized_to_execute": bool(workers_list[0].get("capabilities")),
+                    "registered_workers": [w["worker_id"] for w in workers_list],
+                    "executable_capabilities": workers_list[0].get("capabilities", []),
+                }
+        return {
+            "protocol": PROTOCOL,
+            "server_time": snap["server_time"],
+            "host_resources": inspect_host_resources(),
+            "runtimes": runtimes,
+        }
+
+    def worker_detail(self, worker_id: str) -> dict[str, Any]:
+        with self._lock:
+            moment = self.now()
+            row = self._conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            if row is None:
+                raise ProtocolError(404, "worker not found")
+            public = self._public_worker(row, moment)
+            public["inventory"] = json.loads(row["inventory_json"])
+            return public
+
+    def task_detail(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ProtocolError(404, "task not found")
+            public = self._public_task(row)
+            public["payload"] = json.loads(row["payload_json"])
+            public["log_excerpt"] = row["log_excerpt"]
+            return public
+
+    def _upsert_worker(self, manifest: Manifest, token_hash: str, moment: datetime) -> None:
+        inventory = bounded_json(manifest.inventory)
+        expires = isoformat(moment + timedelta(seconds=self.token_ttl))
+        self._conn.execute(
+            """
+            INSERT INTO workers(
+                worker_id, runtime_name, host_id, model_id, model_id_source, capabilities_json,
+                inventory_json, status, version, token_hash, token_expires, last_heartbeat,
+                created_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                runtime_name = excluded.runtime_name,
+                host_id = excluded.host_id,
+                model_id = excluded.model_id,
+                model_id_source = excluded.model_id_source,
+                capabilities_json = excluded.capabilities_json,
+                inventory_json = excluded.inventory_json,
+                status = excluded.status,
+                version = excluded.version,
+                token_hash = excluded.token_hash,
+                token_expires = excluded.token_expires,
+                last_heartbeat = NULL,
+                revoked_at = NULL
+            """,
+            (
+                manifest.worker_id,
+                manifest.runtime_name,
+                manifest.host_id,
+                manifest.model_id,
+                manifest.model_id_source,
+                json.dumps(manifest.capabilities),
+                inventory,
+                manifest.status,
+                manifest.version,
+                token_hash,
+                expires,
+                isoformat(moment),
+            ),
+        )
+
+    def _write_manifest(self, manifest: Manifest, moment: datetime) -> None:
+        self._conn.execute(
+            """
+            UPDATE workers
+            SET runtime_name = ?, host_id = ?, model_id = ?, model_id_source = ?,
+                capabilities_json = ?, inventory_json = ?, status = ?, version = ?,
+                last_heartbeat = ?
+            WHERE worker_id = ?
+            """,
+            (
+                manifest.runtime_name,
+                manifest.host_id,
+                manifest.model_id,
+                manifest.model_id_source,
+                json.dumps(manifest.capabilities),
+                bounded_json(manifest.inventory),
+                manifest.status,
+                manifest.version,
+                isoformat(moment),
+                manifest.worker_id,
+            ),
+        )
+
+    def _extend_leases(self, worker_id: str, moment: datetime) -> None:
+        expires = isoformat(moment + timedelta(seconds=self.lease_ttl))
+        self._conn.execute(
+            """
+            UPDATE tasks SET lease_expires = ?, updated_at = ?
+            WHERE worker_id = ? AND status IN ('leased', 'cancel_requested')
+            """,
+            (expires, isoformat(moment), worker_id),
+        )
+
+    def _owned_lease(self, worker: sqlite3.Row, task_id: str, lease_id: str) -> sqlite3.Row:
+        task = self._conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if task is None:
+            raise ProtocolError(404, "task not found")
+        if task["status"] in TERMINAL_TASK_STATUSES:
+            raise ProtocolError(409, "task already finished")
+        if task["worker_id"] != worker["worker_id"] or task["lease_id"] != lease_id:
+            raise ProtocolError(403, "lease rejected")
+        if task["status"] not in {"leased", "cancel_requested"}:
+            raise ProtocolError(409, "task is not leased")
+        return task
+
+    def _poll_body(self, worker_id: str, task: sqlite3.Row | None) -> dict[str, Any]:
+        return {
+            "protocol": PROTOCOL,
+            "lease": None if task is None else _public_lease(task),
+            "cancels": self._cancel_ids(worker_id),
+        }
+
+    def _cancel_ids(self, worker_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT task_id FROM tasks WHERE worker_id = ? AND status = 'cancel_requested' ORDER BY task_id",
+            (worker_id,),
+        ).fetchall()
+        return [row["task_id"] for row in rows]
+
+    def _deny_once(self, moment: datetime, task: sqlite3.Row, worker_id: str, missing: set[str]) -> None:
+        inserted = self._conn.execute(
+            "INSERT OR IGNORE INTO capability_denials(task_id, worker_id) VALUES (?, ?)",
+            (task["task_id"], worker_id),
+        )
+        if inserted.rowcount == 1:
+            detail = "missing " + ",".join(sorted(missing))
+            self._event(moment, worker_id, task["task_id"], "capability_denied", detail[:400])
+
+    def _sweep(self, moment: datetime) -> None:
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE status IN ('leased', 'cancel_requested')"
+        ).fetchall()
+        for task in rows:
+            worker = self._conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (task["worker_id"],)
+            ).fetchone()
+            stale = (
+                worker is None
+                or worker["revoked_at"] is not None
+                or self._heartbeat_stale(worker, moment)
+            )
+            if task["lease_expires"] and parse_time(task["lease_expires"]) <= moment:
+                stale = True
+            if not stale:
+                continue
+            if task["status"] == "cancel_requested":
+                self._conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', lease_id = NULL, lease_expires = NULL, updated_at = ? WHERE task_id = ?",
+                    (isoformat(moment), task["task_id"]),
+                )
+                self._event(moment, task["worker_id"], task["task_id"], "cancelled", "worker lost during cancel")
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'queued', worker_id = NULL, lease_id = NULL, lease_expires = NULL, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (isoformat(moment), task["task_id"]),
+                )
+                self._event(
+                    moment,
+                    task["worker_id"],
+                    task["task_id"],
+                    "lease_released",
+                    "heartbeat lost or lease expired",
+                )
+
+    def _release_worker_tasks(self, worker_id: str, moment: datetime) -> None:
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE worker_id = ? AND status IN ('leased', 'cancel_requested')",
+            (worker_id,),
+        ).fetchall()
+        for task in rows:
+            if task["status"] == "cancel_requested":
+                status = "cancelled"
+                worker_value = task["worker_id"]
+            else:
+                status = "queued"
+                worker_value = None
+            self._conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?, worker_id = ?, lease_id = NULL, lease_expires = NULL, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (status, worker_value, isoformat(moment), task["task_id"]),
+            )
+
+    def _heartbeat_stale(self, worker: sqlite3.Row, moment: datetime) -> bool:
+        if worker["last_heartbeat"] is None:
+            return True
+        age = (moment - parse_time(worker["last_heartbeat"])).total_seconds()
+        return age > self.offline_after
+
+    def _presence(self, worker: sqlite3.Row, moment: datetime) -> str:
+        if (
+            worker["revoked_at"] is not None
+            or worker["status"] == "OFFLINE"
+            or self._heartbeat_stale(worker, moment)
+        ):
+            return "OFFLINE"
+        return "LIVE"
+
+    def _public_worker(self, row: sqlite3.Row, moment: datetime) -> dict[str, Any]:
+        inventory = json.loads(row["inventory_json"])
+        presence = self._presence(row, moment)
+        caps = json.loads(row["capabilities_json"])
+        return {
+            "worker_id": row["worker_id"],
+            "runtime_name": row["runtime_name"],
+            "host_id": row["host_id"],
+            "model_id": row["model_id"],
+            "model_id_source": row["model_id_source"],
+            "capabilities": caps,
+            "status": "OFFLINE" if row["revoked_at"] else row["status"],
+            "presence": presence,
+            "connected": presence == "LIVE",
+            "authorized_to_execute": presence == "LIVE" and bool(caps),
+            "version": row["version"],
+            "last_heartbeat": row["last_heartbeat"],
+            "revoked": row["revoked_at"] is not None,
+            "inventory_summary": {
+                "arbitrary_shell_from_dashboard": inventory.get("arbitrary_shell_from_dashboard"),
+                "model_ready": inventory.get("model_ready"),
+                "model_endpoint_probed": inventory.get("model_endpoint_probed"),
+                "observed_session_tools_executable_through_orbit": inventory.get(
+                    "observed_session_tools_executable_through_orbit", False
+                ),
+                "skill_count": inventory.get("skill_count"),
+                "mcp_invoked": inventory.get("mcp_tools_invoked", inventory.get("mcp_invoked")),
+            },
+        }
+
+    def _public_task(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = json.loads(row["result_json"]) if row["result_json"] else None
+        shell_executed = result.get("executed_shell") if isinstance(result, dict) else None
+        return {
+            "task_id": row["task_id"],
+            "type": row["task_type"],
+            "status": row["status"],
+            "worker_id": row["worker_id"],
+            "required_capabilities": json.loads(row["required_json"]),
+            "grant": row["grant_name"],
+            "result": result,
+            "executed_shell": shell_executed,
+            "updated_at": row["updated_at"],
+        }
+
+    def _event(
+        self,
+        moment: datetime,
+        worker_id: str | None,
+        task_id: str | None,
+        kind: str,
+        detail: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO events(ts, worker_id, task_id, kind, detail) VALUES (?, ?, ?, ?, ?)",
+            (isoformat(moment), worker_id, task_id, kind, scrub(detail)[:400]),
+        )
+
+    def _record_failure(self, moment: datetime) -> None:
+        self._conn.execute("INSERT INTO pair_failures(ts) VALUES (?)", (isoformat(moment),))
+        cutoff = isoformat(moment - timedelta(seconds=self.failure_window))
+        self._conn.execute("DELETE FROM pair_failures WHERE ts < ?", (cutoff,))
+
+    def _failure_count(self, moment: datetime) -> int:
+        cutoff = isoformat(moment - timedelta(seconds=self.failure_window))
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM pair_failures WHERE ts >= ?", (cutoff,)
+        ).fetchone()
+        return int(row["n"])
+
+    @staticmethod
+    def _require_same_worker(worker: sqlite3.Row, worker_id: str) -> None:
+        if worker["worker_id"] != worker_id:
+            raise ProtocolError(403, "worker id mismatch")
+
+
+LocalWorkerCoordinator = WorkerBroker
+
+
+def _bearer(authorization: str | None) -> str:
+    if not authorization:
+        raise ProtocolError(401, "credentials rejected")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token or " " in token:
+        raise ProtocolError(401, "credentials rejected")
+    return token
+
+
+def _public_lease(task: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "lease_id": task["lease_id"],
+        "task_id": task["task_id"],
+        "expires_at": task["lease_expires"],
+        "cancel_requested": task["status"] == "cancel_requested",
+        "offer": {
+            "type": task["task_type"],
+            "payload": json.loads(task["payload_json"]),
+            "required_capabilities": json.loads(task["required_json"]),
+            "grant": task["grant_name"],
+        },
+    }
+
+
+def render_worker_dashboard(snapshot: dict[str, Any]) -> str:
+    workers = snapshot.get("workers") or []
+    tasks = snapshot.get("tasks") or []
+    events = snapshot.get("events") or []
+    worker_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td>{html.escape(str(item.get('presence', '')))}</td>"
+            f"<td>{html.escape(str(item.get('status', '')))}</td>"
+            f"<td>{html.escape(str(item.get('worker_id', '')))}</td>"
+            f"<td>{html.escape(str(item.get('runtime_name', '')))}</td>"
+            f"<td>{html.escape(str(item.get('host_id', '')))}</td>"
+            f"<td>{html.escape(str(item.get('model_id') or 'unknown'))} "
+            f"<span>({html.escape(str(item.get('model_id_source') or 'not probed'))})</span></td>"
+            f"<td>{html.escape(', '.join(item.get('capabilities') or []))}</td>"
+            "</tr>"
+        )
+        for item in workers
+    ) or "<tr><td colspan='7'>No paired workers. Presence is not simulated.</td></tr>"
+    task_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td>{html.escape(str(item.get('status', '')))}</td>"
+            f"<td>{html.escape(str(item.get('type', '')))}</td>"
+            f"<td>{html.escape(str(item.get('worker_id') or ''))}</td>"
+            f"<td>{html.escape('' if item.get('executed_shell') is None else str(bool(item.get('executed_shell'))).lower())}</td>"
+            f"<td>{html.escape(json.dumps(item.get('result'), sort_keys=True)) if item.get('result') is not None else ''}</td>"
+            f"<td>{html.escape(str(item.get('updated_at', '')))}</td>"
+            "</tr>"
+        )
+        for item in tasks
+    ) or "<tr><td colspan='6'>No tasks.</td></tr>"
+    event_rows = "\n".join(
+        (
+            "<li>"
+            f"{html.escape(str(item.get('ts', '')))} "
+            f"{html.escape(str(item.get('kind', '')))} "
+            f"{html.escape(str(item.get('worker_id') or ''))} "
+            f"{html.escape(str(item.get('task_id') or ''))}"
+            "</li>"
+        )
+        for item in events
+    ) or "<li>No events.</li>"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ORBIT worker broker</title>
+</head>
+<body>
+  <main>
+    <p class="kicker">ORBIT worker broker · {html.escape(str(snapshot.get("protocol", "")))}</p>
+    <h1>Local workers</h1>
+    <p class="note">LIVE means a heartbeat arrived inside the freshness window. Task payloads are not executed by the broker.</p>
+    <p class="meta">Server time {html.escape(str(snapshot.get("server_time", "")))}</p>
+    <h2>Workers</h2>
+    <table>
+      <thead><tr><th>Presence</th><th>Status</th><th>Worker</th><th>Runtime</th><th>Host</th><th>Model</th><th>Capabilities</th></tr></thead>
+      <tbody>{worker_rows}</tbody>
+    </table>
+    <h2>Tasks</h2>
+    <table>
+      <thead><tr><th>Status</th><th>Type</th><th>Worker</th><th>Shell</th><th>Result</th><th>Updated</th></tr></thead>
+      <tbody>{task_rows}</tbody>
+    </table>
+    <h2>Events</h2>
+    <ul>{event_rows}</ul>
+  </main>
+</body>
+</html>"""
+
+
+def protocol_error_handler(_request: Request, exc: ProtocolError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+
+
+def build_router(broker: WorkerBroker) -> APIRouter:
+    router = APIRouter(prefix="/api/workers")
+
+    def worker_auth(request: Request) -> sqlite3.Row:
+        return broker.authenticate(
+            request.headers.get("authorization"),
+            request.headers.get("x-orbit-nonce"),
+            request.headers.get("x-orbit-timestamp"),
+        )
+
+    def operator_auth(request: Request) -> sqlite3.Row:
+        return broker.authenticate_operator(
+            request.headers.get("authorization"),
+            request.headers.get("x-orbit-operator-token"),
+            request.headers,
+        )
+
+    @router.get("/protocol")
+    def protocol() -> dict[str, Any]:
+        return {
+            "protocol": PROTOCOL,
+            "authentication": "bearer-token-plus-nonce",
+            "operator_authentication": "bearer-operator-token",
+            "bind": "loopback",
+            "executes_payloads": False,
+        }
+
+    @router.get("/discovery")
+    def discovery() -> dict[str, Any]:
+        return broker.discovery_snapshot()
+
+    @router.post("/pairing", status_code=201)
+    def pairing(request: Request) -> dict[str, str]:
+        operator_auth(request)
+        return broker.create_pairing()
+
+    @router.post("/pair", status_code=201)
+    def pair(body: PairRequest) -> dict[str, str]:
+        return broker.pair(body)
 
     @router.post("/heartbeat")
-    def heartbeat(
-        payload: HeartbeatRequest,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-        x_orbit_nonce: str | None = Header(default=None),
-    ):
-        try:
-            worker = coordinator.authenticate_worker(
-                _extract_token(authorization, x_orbit_worker_token, payload.worker_token),
-                expected_worker_id=payload.worker_id,
-                required_scope="worker:heartbeat",
-                nonce=x_orbit_nonce,
-            )
-            res = coordinator.heartbeat(
-                worker["worker_id"],
-                status=payload.status,
-                model_id=payload.model_id,
-                resources=payload.resources,
-            )
-            offers = coordinator.poll_tasks(worker["worker_id"])
-            res["assigned_task"] = offers[0] if offers else None
-            return res
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except WorkerProtocolError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    def heartbeat(body: HeartbeatRequest, request: Request) -> dict[str, Any]:
+        return broker.heartbeat(worker_auth(request), body.manifest)
 
-    @router.get("/poll")
     @router.post("/poll")
-    def poll(
-        payload: PollRequest | None = None,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-        x_orbit_nonce: str | None = Header(default=None),
-    ):
-        try:
-            body_tok = payload.worker_token if payload else None
-            worker = coordinator.authenticate_worker(
-                _extract_token(authorization, x_orbit_worker_token, body_tok),
-                required_scope="worker:poll",
-                nonce=x_orbit_nonce,
-            )
-            offers = coordinator.poll_tasks(worker["worker_id"])
-            return {
-                "worker_id": worker["worker_id"],
-                "offers": offers,
-                "tasks": offers,
-                "assigned_task": offers[0] if offers else None,
-            }
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except WorkerProtocolError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    def poll(request: Request) -> dict[str, Any]:
+        return broker.poll(worker_auth(request))
 
-    @router.post("/claim")
-    def claim(
-        payload: ClaimRequest,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-        x_orbit_nonce: str | None = Header(default=None),
-    ):
-        try:
-            worker = coordinator.authenticate_worker(
-                _extract_token(authorization, x_orbit_worker_token, payload.worker_token),
-                expected_worker_id=payload.worker_id,
-                required_scope="worker:claim",
-                nonce=x_orbit_nonce,
-            )
-            task_id = payload.task_id
-            if not task_id:
-                offers = coordinator.poll_tasks(worker["worker_id"])
-                if not offers:
-                    raise WorkerProtocolError("no ASSIGNED/PENDING task for this worker")
-                task_id = offers[0]["task_id"]
-            claimed = coordinator.claim_task(task_id, worker["worker_id"])
-            return {"claimed": True, **claimed}
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except WorkerProtocolError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @router.post("/progress")
-    def progress(
-        payload: ProgressRequest,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-        x_orbit_nonce: str | None = Header(default=None),
-    ):
-        try:
-            worker = coordinator.authenticate_worker(
-                _extract_token(authorization, x_orbit_worker_token, payload.worker_token),
-                expected_worker_id=payload.worker_id,
-                required_scope="worker:report",
-                nonce=x_orbit_nonce,
-            )
-            return coordinator.record_progress({
-                "task_id": payload.task_id,
-                "lease_id": payload.lease_id,
-                "worker_id": worker["worker_id"],
-                "stage": payload.stage,
-                "percent": payload.percent,
-                "message": payload.message,
-            })
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except WorkerProtocolError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @router.post("/report")
-    def report(
-        payload: ReportRequest,
-        authorization: str | None = Header(default=None),
-        x_orbit_worker_token: str | None = Header(default=None),
-        x_orbit_nonce: str | None = Header(default=None),
-    ):
-        try:
-            worker = coordinator.authenticate_worker(
-                _extract_token(authorization, x_orbit_worker_token, payload.worker_token),
-                expected_worker_id=payload.worker_id,
-                required_scope="worker:report",
-                nonce=x_orbit_nonce,
-            )
-            task_id = payload.task_id or worker.get("assigned_task_id")
-            if not task_id:
-                raise WorkerProtocolError("Missing task_id and worker has no active assigned_task_id")
-            artifacts = payload.artifact_details or payload.artifacts
-            reported = coordinator.report_result(
-                {
-                    "task_id": task_id,
-                    "lease_id": payload.lease_id,
-                    "worker_id": worker["worker_id"],
-                    "status": payload.status,
-                    "summary": payload.summary or payload.notes,
-                    "artifacts": artifacts,
-                    "logs": payload.logs,
-                },
-                worker_id=worker["worker_id"],
-            )
-            return {"reported": True, "task": reported, **reported}
-        except WorkerAuthError as exc:
-            raise HTTPException(401, str(exc)) from exc
-        except WorkerCancelledError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        except WorkerProtocolError as exc:
-            raise HTTPException(400, str(exc)) from exc
+    @router.post("/revoke")
+    def revoke(body: RevokeRequest, request: Request) -> dict[str, str]:
+        operator_auth(request)
+        return broker.revoke(body.worker_id)
 
     @router.post("/tasks", status_code=201)
-    def enqueue_task(payload: EnqueueTaskRequest):
-        return coordinator.enqueue_task(
-            payload.title,
-            payload.spec,
-            mission_id=payload.mission_id,
-            capability_required=payload.capability_required,
-            grant=payload.grant,
-        )
+    def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
+        operator_auth(request)
+        return broker.enqueue(body)
 
-    @router.post("/cancel")
-    def cancel(payload: CancelTaskRequest):
-        try:
-            return coordinator.cancel_task(payload.task_id, reason=payload.reason)
-        except WorkerProtocolError as exc:
-            raise HTTPException(404, str(exc)) from exc
+    @router.get("/tasks")
+    def list_tasks() -> dict[str, Any]:
+        return {"protocol": PROTOCOL, "tasks": broker.snapshot()["tasks"]}
+
+    @router.get("/tasks/{task_id}")
+    def task_detail(task_id: str) -> dict[str, Any]:
+        return broker.task_detail(task_id)
+
+    @router.post("/tasks/{task_id}/progress")
+    def progress(task_id: str, body: ProgressRequest, request: Request) -> dict[str, str]:
+        return broker.progress(worker_auth(request), task_id, body)
+
+    @router.post("/tasks/{task_id}/result")
+    def result(task_id: str, body: ResultRequest, request: Request) -> dict[str, str]:
+        return broker.result(worker_auth(request), task_id, body)
+
+    @router.post("/tasks/{task_id}/cancel")
+    def cancel(task_id: str, request: Request) -> dict[str, str]:
+        operator_auth(request)
+        return broker.cancel(task_id)
+
+    @router.get("")
+    def list_workers() -> dict[str, Any]:
+        snap = broker.snapshot()
+        return {"protocol": PROTOCOL, "workers": snap["workers"], "server_time": snap["server_time"]}
+
+    @router.get("/{worker_id}")
+    def worker_detail(worker_id: str) -> dict[str, Any]:
+        return broker.worker_detail(worker_id)
 
     return router
 
 
-def mount_worker_bridge(app: FastAPI, coordinator: LocalWorkerCoordinator) -> None:
-    """Mount both `/api/workers/v0.1` and `/api/workers` on a FastAPI app."""
-    router = create_worker_router(coordinator)
-    app.include_router(router, prefix="/api/workers/v0.1", tags=["workers-v0.1"])
-    app.include_router(router, prefix="/api/workers", tags=["workers"])
-    app.state.worker_coordinator = coordinator
+def mount_worker_api(app: FastAPI, broker: WorkerBroker | None = None, db_path: Path | None = None) -> WorkerBroker:
+    """Attach canonical `orbit.workers.v0.1` routes to a FastAPI app.
+
+    Idempotent: if `app.state.worker_broker` is already mounted, returns the
+    existing broker without registering duplicate routes.
+    """
+    existing = getattr(app.state, "worker_broker", None)
+    if existing is not None:
+        return existing
+    resolved_broker = broker or WorkerBroker(db_path or default_database())
+    app.state.worker_broker = resolved_broker
+    app.state.broker = resolved_broker
+    app.add_exception_handler(ProtocolError, protocol_error_handler)
+    app.include_router(build_router(resolved_broker))
+
+    @app.get("/workers", include_in_schema=False)
+    def workers_status_page() -> HTMLResponse:
+        return HTMLResponse(render_worker_dashboard(resolved_broker.snapshot()))
+
+    app.router.on_shutdown.append(resolved_broker.close)
+    return resolved_broker
+
+
+mount_worker_bridge = mount_worker_api
+
+
+def create_worker_app(database: Path, clock: Any | None = None, **broker_kwargs: Any) -> FastAPI:
+    broker = WorkerBroker(database, clock=clock, **broker_kwargs)
+    app = FastAPI(title="ORBIT Worker Broker", version=PROTOCOL, docs_url=None, redoc_url=None)
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"],
+    )
+    mount_worker_api(app, broker)
+
+    @app.middleware("http")
+    async def browser_safety(request: Request, call_next):
+        if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            origin = request.headers.get("origin")
+            if origin:
+                parsed = urlsplit(origin)
+                if parsed.scheme not in {"http", "https"} or parsed.netloc != request.headers.get("host", ""):
+                    return JSONResponse(status_code=403, content={"detail": "Cross-origin mutation denied"})
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/", include_in_schema=False)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(render_worker_dashboard(broker.snapshot()))
+
+    @app.get("/api/health")
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "service": "orbit-worker-broker",
+            "protocol": PROTOCOL,
+            "bind": "127.0.0.1",
+            "auth": "worker_bearer",
+            "operator_auth": "bearer_operator_token",
+            "executes_payloads": False,
+        }
+
+    return app
 
 
 # ---------------------------------------------------------------------------
-# Authenticated Worker Adapter Client (Antigravity / Hermes / OpenCode / LUNA)
+# Antigravity Worker Client (`orbit.workers.v0.1` + Cross-Adapter Compatible)
 # ---------------------------------------------------------------------------
 
-class OrbitWorkerAdapter:
-    """Client adapter connecting a real local agent runtime to the ORBIT coordinator."""
+
+def handle_ping(lease: dict[str, Any]) -> dict[str, Any]:
+    payload = lease.get("offer", {}).get("payload") or {}
+    message = payload.get("message", "")
+    if not isinstance(message, str) or len(message) > 500:
+        raise ValueError("ping message rejected")
+    return {"pong": message, "executed_shell": False}
+
+
+def handle_inventory(lease: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+    del lease
+    return {"inventory": inventory, "executed_shell": False}
+
+
+def handle_smoke_check(
+    lease: dict[str, Any],
+    *,
+    workspace_root: Path,
+    worker_id: str,
+    runtime_name: str,
+    model_id: str | None,
+) -> dict[str, Any]:
+    offer = lease.get("offer") or {}
+    payload = offer.get("payload") or {}
+    for forbidden in ("shell_command", "raw_shell", "bash", "cmd", "command"):
+        if forbidden in payload:
+            raise PermissionError(f"Forbidden raw shell key '{forbidden}' in payload")
+
+    root = workspace_root.resolve()
+    output_rel = payload.get("output_path")
+    written_files: list[str] = []
+    if output_rel:
+        if not isinstance(output_rel, str) or output_rel.startswith("/"):
+            raise PermissionError("output_path must be a relative path inside workspace_root")
+        target = (root / output_rel).resolve()
+        if target != root and root not in target.parents:
+            raise PermissionError("Path traversal outside workspace_root denied")
+        for part in target.relative_to(root).parts:
+            if part in {".git", ".env"} or part.startswith(".env.") or part.endswith((".pem", ".key")):
+                raise PermissionError(f"Denied path segment '{part}'")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        proof_text = (
+            f"# ORBIT Worker Proof ({worker_id})\n\n"
+            f"- **Protocol**: `{PROTOCOL}`\n"
+            f"- **Runtime**: `{runtime_name}`\n"
+            f"- **Model**: `{model_id}`\n"
+            f"- **Task ID**: `{lease.get('task_id')}`\n"
+            f"- **Lease ID**: `{lease.get('lease_id')}`\n"
+            f"- **Verified At**: `{isoformat(utcnow())}`\n"
+        )
+        target.write_text(proof_text, encoding="utf-8")
+        written_files.append(str(target.relative_to(root)))
+
+    return {
+        "status": "VERIFIED",
+        "worker_id": worker_id,
+        "runtime_name": runtime_name,
+        "model_id": model_id,
+        "written_files": written_files,
+        "executed_shell": False,
+    }
+
+
+class AntigravityWorker:
+    """`orbit.workers.v0.1` compliant worker client for Google Antigravity."""
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8765",
-        manifest: WorkerManifest | None = None,
+        base_url: str,
         *,
-        client: httpx.Client | None = None,
-        api_prefix: str = "/api/workers/v0.1",
-        default_workspace: Path | None = None,
-        model_available_check: Callable[[str], bool] | None = None,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.api_prefix = "/" + api_prefix.strip("/")
-        self.manifest = manifest or inspect_antigravity_runtime()
-        self._client = client or httpx.Client(base_url=self.base_url, timeout=10.0)
+        client: Any | None = None,
+        state_path: Path | None = None,
+        workspace_root: Path | None = None,
+        inventory: dict[str, Any] | None = None,
+        token: str | None = None,
+        worker_id: str | None = None,
+        capabilities: list[str] | None = None,
+        enforce_loopback: bool = True,
+        clock: Any | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self.base_url = assert_loopback_url(base_url) if enforce_loopback else base_url.rstrip("/")
+        self.client = client or httpx.Client(base_url=self.base_url, timeout=5.0)
+        self.state_path = state_path
+        self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.inventory = inventory if inventory is not None else build_antigravity_inventory()
+        self.token = token
+        self.worker_id = worker_id
+        self.capabilities = (
+            list(capabilities)
+            if capabilities is not None
+            else list(self.inventory.get("executable_capabilities") or EXECUTABLE_CAPABILITIES)
+        )
+        self.clock = clock
+        self.log = log or (lambda _line: None)
+        self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+            "orbit.ping": handle_ping,
+            "orbit.inventory": lambda lease: handle_inventory(lease, self.inventory),
+            "orbit.smoke_check": lambda lease: handle_smoke_check(
+                lease,
+                workspace_root=self.workspace_root,
+                worker_id=self.worker_id or "antigravity-worker",
+                runtime_name=str(self.inventory.get("runtime_name") or "antigravity"),
+                model_id=self.inventory.get("model_id"),
+            ),
+        }
         self._owns_client = client is None
-        self.default_workspace = (default_workspace or Path.home() / "Projects").resolve()
-        self.worker_token: str | None = None
-        self.token_hint: str = "<unpaired>"
-        self.registered_worker_id: str = self.manifest.worker_id
-        self.cancelled_tasks: set[str] = set()
-        self.model_available_check = model_available_check
 
     def close(self) -> None:
-        if self._owns_client:
-            self._client.close()
+        if self._owns_client and hasattr(self.client, "close"):
+            self.client.close()
 
-    def _url(self, path: str) -> str:
-        rel = f"{self.api_prefix}/{path.lstrip('/')}"
-        if self._client.base_url and str(self._client.base_url).rstrip("/"):
-            return rel
-        return f"{self.base_url}{rel}"
+    def check_protocol(self) -> dict[str, Any]:
+        response = self.client.get("/api/workers/protocol")
+        body = self._json(response)
+        if body.get("protocol") != PROTOCOL:
+            raise WorkerClientError(409, "protocol mismatch")
+        return body
 
-    def _headers(self, *, use_nonce: bool = True) -> dict[str, str]:
-        if not self.worker_token:
-            raise WorkerAuthError("Adapter is not paired yet (no worker_token)")
-        headers = {"Authorization": f"Bearer {self.worker_token}"}
-        if use_nonce:
-            headers["X-Orbit-Nonce"] = secrets.token_hex(12)
-        return headers
-
-    def pair_and_register(self, pairing_code: str, *, nonce: str | None = None) -> dict[str, Any]:
-        """Exchange a short-lived pairing code for a scoped worker bearer token."""
-        if self.manifest.status == "OFFLINE":
-            raise WorkerProtocolError(f"Cannot register OFFLINE runtime '{self.manifest.runtime_name}'")
-        chosen_nonce = nonce or secrets.token_hex(12)
-        # Issue #12 fleet.py ALLOWED_KINDS = ("mock", "hermes", "opencode", "custom")
-        compat_kind = self.manifest.runtime_name if self.manifest.runtime_name in ("mock", "hermes", "opencode") else "custom"
-        payload = {
-            "pairing_code": pairing_code,
-            "nonce": chosen_nonce,
-            "manifest": self.manifest.to_dict(),
-            "worker_id": self.manifest.worker_id,
-            "name": self.manifest.worker_id[:64],
-            "runtime_name": self.manifest.runtime_name,
-            "kind": compat_kind,
-            "host_id": self.manifest.host_id,
-            "host": self.manifest.host_id[:120],
-            "model_id": self.manifest.model_id,
-            "capabilities": list(self.manifest.capabilities)[:24],
-            "tool_allowlist": list(self.manifest.tool_allowlist),
-            "skills": list(self.manifest.skills),
-            "status": self.manifest.status,
-            "version": self.manifest.version[:40],
+    def pair(self, pairing_code: str, worker_id: str | None = None) -> dict[str, Any]:
+        if not self.inventory.get("binary_present", True):
+            raise WorkerClientError(400, "Cannot pair an OFFLINE runtime")
+        self.check_protocol()
+        manifest = manifest_from_inventory(
+            self.inventory,
+            worker_id=worker_id or self.worker_id,
+            capabilities=self.capabilities,
+        )
+        response = self.client.post(
+            "/api/workers/pair",
+            json={"protocol": PROTOCOL, "pairing_code": pairing_code, "manifest": manifest},
+        )
+        body = self._json(response)
+        self.token = body["token"]
+        self.worker_id = body["worker_id"]
+        if self.state_path is not None:
+            save_state(
+                self.state_path,
+                {
+                    "protocol": PROTOCOL,
+                    "url": self.base_url,
+                    "worker_id": self.worker_id,
+                    "token": self.token,
+                },
+            )
+        self.log(f"paired worker_id={self.worker_id} token=stored")
+        return {
+            "worker_id": self.worker_id,
+            "protocol": body["protocol"],
+            "token_stored": self.state_path is not None,
         }
-        resp = self._client.post(self._url("register"), json=payload)
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Authentication failed"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Registration failed ({resp.status_code})"))
-        data = resp.json()
-        token = data.get("worker_token") or data.get("token")
-        if not token:
-            raise WorkerProtocolError("Coordinator response did not include worker_token")
-        self.worker_token = str(token)
-        self.token_hint = mask_secret(self.worker_token)
-        if data.get("worker_id"):
-            self.registered_worker_id = str(data["worker_id"])
-        return data
 
-    def send_heartbeat(self, *, status: str | None = None) -> dict[str, Any]:
-        """Send authenticated liveness heartbeat and record any cancellation signals."""
-        headers = self._headers()
-        payload = {
-            "worker_id": self.registered_worker_id,
-            "worker_token": self.worker_token,
-            "status": status or self.manifest.status,
-            "model_id": self.manifest.model_id,
-            "resources": inspect_host_resources(),
-        }
-        resp = self._client.post(self._url("heartbeat"), json=payload, headers=headers)
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Unauthorized heartbeat"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Heartbeat failed ({resp.status_code})"))
-        data = resp.json()
-        for c in data.get("cancellations") or []:
-            tid = c.get("task_id")
-            if tid:
-                self.cancelled_tasks.add(str(tid))
-        return data
-
-    def poll_offers(self) -> list[dict[str, Any]]:
-        """Poll coordinator for eligible tasks matching this worker's declared capabilities."""
-        headers = self._headers()
-        resp = self._client.post(
-            self._url("poll"),
-            json={"worker_id": self.registered_worker_id, "worker_token": self.worker_token},
-            headers=headers,
+    def heartbeat(self, status: str = "IDLE") -> dict[str, Any]:
+        manifest = manifest_from_inventory(
+            self.inventory,
+            worker_id=self.worker_id,
+            capabilities=self.capabilities,
         )
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Unauthorized poll"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Poll failed ({resp.status_code})"))
-        data = resp.json()
-        offers = list(data.get("offers") or data.get("tasks") or [])
-        if not offers and data.get("assigned_task"):
-            offers = [data["assigned_task"]]
-        return offers
-
-    def claim(self, task_id: str) -> dict[str, Any]:
-        """Acquire an exclusive lease on `task_id`."""
-        headers = self._headers()
-        resp = self._client.post(
-            self._url("claim"),
-            json={
-                "task_id": task_id,
-                "worker_id": self.registered_worker_id,
-                "worker_token": self.worker_token,
-            },
-            headers=headers,
+        manifest["status"] = status
+        response = self.client.post(
+            "/api/workers/heartbeat",
+            headers=self._headers(),
+            json={"manifest": manifest},
         )
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Unauthorized claim"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Claim denied ({resp.status_code})"))
-        return resp.json()
+        return self._json(response)
 
-    def send_progress(self, task_id: str, lease_id: str, *, stage: str, percent: int, message: str) -> dict[str, Any]:
-        """Send task progress event and check for mid-flight cancellation."""
-        headers = self._headers()
-        resp = self._client.post(
-            self._url("progress"),
-            json={
-                "task_id": task_id,
-                "lease_id": lease_id,
-                "worker_id": self.registered_worker_id,
-                "worker_token": self.worker_token,
-                "stage": stage,
-                "percent": percent,
-                "message": message,
-            },
-            headers=headers,
-        )
-        if resp.status_code == 404:
-            # Issue #12 minimal router does not expose /progress; fall back to /heartbeat
-            return self.send_heartbeat(status="LIVE")
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Unauthorized progress"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Progress failed ({resp.status_code})"))
-        data = resp.json()
-        if data.get("status") == "cancelled" or data.get("cancel"):
-            self.cancelled_tasks.add(task_id)
-            reason = (data.get("cancel") or {}).get("reason") or "Task cancelled"
-            raise WorkerCancelledError(reason)
-        return data
+    def poll(self) -> dict[str, Any]:
+        response = self.client.post("/api/workers/poll", headers=self._headers())
+        return self._json(response)
 
-    def submit_result(self, result: TaskResult) -> dict[str, Any]:
-        """Report task completion or failure to coordinator."""
-        headers = self._headers()
-        artifact_paths = [
-            str(a.get("path")) if isinstance(a, dict) and a.get("path") else str(a)
-            for a in result.artifacts
-        ]
-        payload = {
-            **result.to_dict(),
-            "worker_id": self.registered_worker_id,
-            "worker_token": self.worker_token,
-            "notes": result.summary,
-            "artifacts": artifact_paths,
-            "artifact_details": result.artifacts,
-        }
-        resp = self._client.post(self._url("report"), json=payload, headers=headers)
-        if resp.status_code in (401, 403):
-            raise WorkerAuthError(resp.json().get("detail", "Unauthorized report"))
-        if resp.status_code == 409:
-            raise WorkerCancelledError(resp.json().get("detail", "Task cancelled"))
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Report failed ({resp.status_code})"))
-        return resp.json()
-
-    def unregister(self) -> dict[str, Any]:
-        """Revoke this worker's active token cleanly."""
-        headers = self._headers()
-        resp = self._client.post(
-            self._url("unregister"),
-            json={"worker_id": self.registered_worker_id, "worker_token": self.worker_token},
-            headers=headers,
-        )
-        if resp.status_code >= 400:
-            raise WorkerProtocolError(resp.json().get("detail", f"Unregister failed ({resp.status_code})"))
-        return resp.json()
-
-    def execute_scoped_task(
+    def progress(
         self,
-        task: dict[str, Any],
-        lease: dict[str, Any],
-        *,
-        on_step_hook: Callable[[], None] | None = None,
-    ) -> TaskResult:
-        """Execute a single leased task strictly within its MissionGrant without arbitrary shell execution."""
-        task_id = str(task.get("task_id") or task.get("id"))
-        lease_id = str(lease.get("lease_id") or "")
-        spec = dict(task.get("spec") or {})
-        grant = dict(task.get("grant") or {})
-        if not grant and task.get("mission_id"):
-            try:
-                m_url = f"/api/missions/{task['mission_id']}"
-                if not (self._client.base_url and str(self._client.base_url).rstrip("/")):
-                    m_url = f"{self.base_url}{m_url}"
-                m_resp = self._client.get(m_url)
-                if m_resp.status_code == 200:
-                    m_data = m_resp.json()
-                    if isinstance(m_data.get("grant"), dict):
-                        grant = dict(m_data["grant"])
-            except Exception:
-                pass
-        logs: list[str] = [f"Worker {self.registered_worker_id} ({self.manifest.runtime_name}) starting task {task_id[:8]}"]
-
-        if task_id in self.cancelled_tasks:
-            raise WorkerCancelledError("Task was cancelled prior to execution")
-
-        # 1. Check model requirement if specified by task
-        required_model = spec.get("require_model")
-        if required_model:
-            is_avail = (
-                self.model_available_check(str(required_model))
-                if self.model_available_check is not None
-                else (self.manifest.model_id == required_model)
-            )
-            if not is_avail:
-                msg = f"MODEL_UNAVAILABLE: required model '{required_model}' is not online on {self.registered_worker_id}"
-                logs.append(msg)
-                return TaskResult(
-                    task_id=task_id,
-                    lease_id=lease_id,
-                    worker_id=self.registered_worker_id,
-                    status="DEGRADED",
-                    summary=msg,
-                    artifacts=[],
-                    logs=logs,
-                )
-
-        # 2. Enforce operation allowlist (never execute arbitrary shell commands)
-        op = str(spec.get("op") or "deliver").strip()
-        if op not in ALLOWED_TASK_OPS:
-            msg = f"GRANT DENIED: operation '{op}' is not in worker allowlist (arbitrary shell/command execution prohibited)"
-            logs.append(msg)
-            return TaskResult(
-                task_id=task_id,
-                lease_id=lease_id,
-                worker_id=self.registered_worker_id,
-                status="BLOCKED",
-                summary=msg,
-                artifacts=[],
-                logs=logs,
-            )
-
-        # 3. Validate workspace grant root and path confinement
-        root_str = grant.get("root") or spec.get("workspace_root") or str(self.default_workspace)
-        root = Path(root_str).expanduser().resolve()
-        rel_path = str(spec.get("path") or ".").strip()
-        denied_paths = [str(p).rstrip("/") for p in (grant.get("denied_paths") or [])]
-
-        for denied in denied_paths:
-            if rel_path == denied or rel_path.startswith(denied + "/"):
-                msg = f"GRANT DENIED: path '{rel_path}' is explicitly excluded by mission grant"
-                logs.append(msg)
-                return TaskResult(
-                    task_id=task_id,
-                    lease_id=lease_id,
-                    worker_id=self.registered_worker_id,
-                    status="BLOCKED",
-                    summary=msg,
-                    artifacts=[],
-                    logs=logs,
-                )
-
-        try:
-            target = checked_path(root, rel_path) if rel_path != "." else root
-        except (PermissionError, ValueError) as exc:
-            msg = f"GRANT DENIED: {exc}"
-            logs.append(msg)
-            return TaskResult(
-                task_id=task_id,
-                lease_id=lease_id,
-                worker_id=self.registered_worker_id,
-                status="BLOCKED",
-                summary=msg,
-                artifacts=[],
-                logs=logs,
-            )
-
-        self.send_progress(task_id, lease_id, stage="PREPARE", percent=25, message=f"Validated grant path {rel_path}")
-        if on_step_hook:
-            on_step_hook()
-        if task_id in self.cancelled_tasks:
-            raise WorkerCancelledError("Task cancelled during preparation")
-
-        # 4. Perform the allowlisted non-destructive operation
-        if op in ("inspect", "workspace.inspect"):
-            if not target.exists():
-                return TaskResult(
-                    task_id=task_id,
-                    lease_id=lease_id,
-                    worker_id=self.registered_worker_id,
-                    status="FAILED",
-                    summary=f"Target path does not exist: {rel_path}",
-                    artifacts=[],
-                    logs=logs,
-                )
-            entries = sorted(p.name for p in target.iterdir() if p.name not in DENIED_NAMES)[:50] if target.is_dir() else [target.name]
-            self.send_progress(task_id, lease_id, stage="VERIFY", percent=90, message=f"Inspected {len(entries)} entries")
-            logs.append(f"Inspected {rel_path}: {len(entries)} item(s)")
-            return TaskResult(
-                task_id=task_id,
-                lease_id=lease_id,
-                worker_id=self.registered_worker_id,
-                status="SUBMITTED",
-                summary=f"Inspected {rel_path} ({len(entries)} visible entries)",
-                artifacts=[{"path": rel_path, "entries": entries}],
-                logs=logs,
-            )
-
-        if op in ("read", "workspace.read"):
-            if not target.is_file():
-                return TaskResult(
-                    task_id=task_id,
-                    lease_id=lease_id,
-                    worker_id=self.registered_worker_id,
-                    status="FAILED",
-                    summary=f"File not found: {rel_path}",
-                    artifacts=[],
-                    logs=logs,
-                )
-            digest = _file_sha256(target)
-            size_b = target.stat().st_size
-            self.send_progress(task_id, lease_id, stage="VERIFY", percent=90, message=f"Read {rel_path} ({size_b}B)")
-            return TaskResult(
-                task_id=task_id,
-                lease_id=lease_id,
-                worker_id=self.registered_worker_id,
-                status="SUBMITTED",
-                summary=f"Read {rel_path} (sha256={digest[:16]}...)",
-                artifacts=[{"path": rel_path, "sha256": digest, "size_bytes": size_b}],
-                logs=logs,
-            )
-
-        # op in ('deliver', 'retry-deliver', 'workspace.write_scoped')
-        needles = [str(n) for n in (spec.get("must_contain") or []) if n]
-        explicit_content = spec.get("content")
-        if isinstance(explicit_content, str) and explicit_content:
-            content = explicit_content
-            for n in needles:
-                if n not in content:
-                    content = content.rstrip("\n") + f"\n{n}\n"
-        else:
-            lines = [
-                f"# ORBIT Verified Artifact — {rel_path}",
-                f"worker_id: {self.registered_worker_id}",
-                f"runtime_name: {self.manifest.runtime_name}",
-                f"host_id: {self.manifest.host_id}",
-                f"model_id: {self.manifest.model_id or 'none'}",
-                f"task_id: {task_id}",
-            ]
-            for n in needles:
-                lines.append(str(n))
-            content = "\n".join(lines) + "\n"
-
-        if len(content) > MAX_WRITE_CHARS:
-            return TaskResult(
-                task_id=task_id,
-                lease_id=lease_id,
-                worker_id=self.registered_worker_id,
-                status="BLOCKED",
-                summary=f"Content exceeds MAX_WRITE_CHARS ({MAX_WRITE_CHARS})",
-                artifacts=[],
-                logs=logs,
-            )
-
-        self.send_progress(task_id, lease_id, stage="WRITE", percent=65, message=f"Writing scoped artifact {rel_path}")
-        if on_step_hook:
-            on_step_hook()
-        if task_id in self.cancelled_tasks:
-            raise WorkerCancelledError("Task cancelled before atomic write commit")
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".orbit-worker-", dir=target.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, target)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
-
-        digest = _file_sha256(target)
-        size_b = target.stat().st_size
-        self.send_progress(task_id, lease_id, stage="VERIFY", percent=95, message=f"Computed artifact sha256={digest[:16]}...")
-        logs.append(f"Delivered {rel_path} ({size_b} bytes, sha256={digest})")
-        return TaskResult(
-            task_id=task_id,
-            lease_id=lease_id,
-            worker_id=self.registered_worker_id,
-            status="SUBMITTED",
-            summary=f"Delivered {rel_path} ({size_b} bytes, sha256={digest[:16]}...)",
-            artifacts=[{"path": rel_path, "sha256": digest, "size_bytes": size_b}],
-            logs=logs,
+        task_id: str,
+        lease_id: str,
+        status: str,
+        progress: float,
+        message: str,
+    ) -> dict[str, Any]:
+        response = self.client.post(
+            f"/api/workers/tasks/{task_id}/progress",
+            headers=self._headers(),
+            json={
+                "lease_id": lease_id,
+                "event_id": uuid.uuid4().hex,
+                "status": status,
+                "progress": progress,
+                "message": scrub(message, [self.token or ""]),
+            },
         )
+        return self._json(response)
 
-    def run_once(self, *, on_step_hook: Callable[[], None] | None = None) -> dict[str, Any] | None:
-        """Send heartbeat, poll for one eligible task, claim lease, execute within grant, and report result."""
-        beat = self.send_heartbeat(status="IDLE")
-        offers = self.poll_offers()
-        if not offers and beat.get("assigned_task"):
-            offers = [beat["assigned_task"]]
-        if not offers:
-            return None
-        offer = offers[0]
-        task_id = str(offer.get("task_id") or offer.get("id"))
-        claimed = self.claim(task_id)
-        lease = claimed.get("lease") or {"lease_id": ""}
-        task_obj = dict(claimed.get("task") or offer)
-        if "grant" not in task_obj and "grant" in offer:
-            task_obj["grant"] = offer["grant"]
+    def result(
+        self,
+        task_id: str,
+        lease_id: str,
+        status: str,
+        result: dict[str, Any],
+        log_excerpt: str,
+    ) -> dict[str, Any]:
+        response = self.client.post(
+            f"/api/workers/tasks/{task_id}/result",
+            headers=self._headers(),
+            json={
+                "lease_id": lease_id,
+                "status": status,
+                "result": result,
+                "log_excerpt": scrub(log_excerpt, [self.token or ""]),
+            },
+        )
+        return self._json(response)
+
+    def handle_once(self) -> dict[str, Any]:
+        beat = self.heartbeat("IDLE")
+        polled = self.poll()
+        lease = polled.get("lease")
+        if not lease:
+            return {"action": "idle", "presence": beat.get("presence"), "executed_shell": False}
+        task_id = lease["task_id"]
+        lease_id = lease["lease_id"]
+        cancels = set(polled.get("cancels") or [])
+        if lease.get("cancel_requested") or task_id in cancels:
+            self.result(
+                task_id,
+                lease_id,
+                "cancelled",
+                {"cancelled": True, "executed_shell": False},
+                "cancel acknowledged",
+            )
+            return {"action": "cancelled", "task_id": task_id, "executed_shell": False}
+        task_type = lease["offer"]["type"]
+        handler = self.handlers.get(task_type)
+        self.progress(task_id, lease_id, "accepted", 0.2, "accepted")
+        if handler is None:
+            self.result(
+                task_id,
+                lease_id,
+                "rejected",
+                {"reason": "unsupported_task", "task_type": task_type, "executed_shell": False},
+                "not executed",
+            )
+            return {"action": "rejected", "task_id": task_id, "executed_shell": False}
+        self.heartbeat("BUSY")
         try:
-            result = self.execute_scoped_task(task_obj, lease, on_step_hook=on_step_hook)
-        except WorkerCancelledError as exc:
-            return {"task_id": task_id, "status": "CANCELLED", "reason": str(exc)}
-        return self.submit_result(result)
+            output = handler(lease)
+        except PermissionError as exc:
+            self.result(
+                task_id,
+                lease_id,
+                "rejected",
+                {"reason": "permission_denied", "detail": str(exc), "executed_shell": False},
+                "permission denied",
+            )
+            self.heartbeat("IDLE")
+            return {"action": "rejected", "task_id": task_id, "executed_shell": False}
+        except Exception as exc:
+            self.result(
+                task_id,
+                lease_id,
+                "error",
+                {"error": type(exc).__name__, "executed_shell": False},
+                "handler failed",
+            )
+            self.heartbeat("ERROR")
+            return {"action": "error", "task_id": task_id, "executed_shell": False}
+        if not isinstance(output, dict):
+            self.result(
+                task_id,
+                lease_id,
+                "error",
+                {"error": "non_object_result", "executed_shell": False},
+                "bad handler result",
+            )
+            return {"action": "error", "task_id": task_id, "executed_shell": False}
+        output["executed_shell"] = False
+        self.progress(task_id, lease_id, "running", 1.0, "finished")
+        self.result(task_id, lease_id, "completed", output, "ok")
+        self.heartbeat("IDLE")
+        return {"action": "completed", "task_id": task_id, "result": output, "executed_shell": False}
 
+    def _headers(self) -> dict[str, str]:
+        if not self.token:
+            raise WorkerClientError(401, "worker is not paired")
+        ts = int(self.clock.now().timestamp()) if self.clock is not None else int(time.time())
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "X-Orbit-Nonce": secrets.token_hex(16),
+            "X-Orbit-Timestamp": str(ts),
+        }
+
+    @staticmethod
+    def _json(response: Any) -> dict[str, Any]:
+        try:
+            body = response.json()
+        except Exception:
+            body = {"detail": "non-JSON response"}
+        if response.status_code >= 400:
+            detail = body.get("detail") if isinstance(body, dict) else "request rejected"
+            raise WorkerClientError(response.status_code, str(detail))
+        if not isinstance(body, dict):
+            raise WorkerClientError(response.status_code, "expected a JSON object")
+        return body
+
+
+OrbitWorkerAdapter = AntigravityWorker

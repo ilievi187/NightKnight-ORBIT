@@ -60,8 +60,11 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
 
     @app.get("/api/health")
     def health():
+        snap = broker.snapshot()
+        live_workers = [w["worker_id"] for w in snap["workers"] if w.get("presence") == "LIVE"]
         return {"status": "ok", "version": "0.1.0", "provider_status": "not_checked", "model": settings.model,
-                "base_url": settings.base_url, "workspace": str(settings.workspace), "write_policy": "human_approval"}
+                "base_url": settings.base_url, "workspace": str(settings.workspace), "write_policy": "human_approval",
+                "worker_protocol": snap["protocol"], "workers_live": len(live_workers), "live_worker_ids": live_workers}
 
     @app.get("/api/agents")
     def agents():
@@ -104,7 +107,12 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    from .worker_bridge import WorkerBroker, mount_worker_api
+
+    worker_db = settings.database.with_name("worker-broker.sqlite3")
+    broker = mount_worker_api(app, WorkerBroker(worker_db))
     return app
 
 
 app = create_app()
+

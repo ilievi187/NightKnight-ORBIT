@@ -60,10 +60,20 @@ jobs:
         run: |
           pyinstaller packaging/orbit-mock-worker.spec --noconfirm --distpath dist/worker
 
+      - name: Build single-file AppImage backend sidecar
+        run: |
+          pyinstaller packaging/orbit-appimage-server.spec --noconfirm --distpath dist/appimage
+          test -x dist/appimage/orbit-server
+
+      - name: Generate self-contained ORBIT desktop icons
+        run: |
+          python tools/generate_desktop_icons.py
+          file src-tauri/icons/128x128.png
+
       - name: Stage sidecars for Tauri externalBin
         run: |
           mkdir -p src-tauri/binaries
-          cp dist/server/orbit-server/orbit-server src-tauri/binaries/orbit-server-x86_64-unknown-linux-gnu
+          cp dist/appimage/orbit-server src-tauri/binaries/orbit-server-x86_64-unknown-linux-gnu
           cp dist/worker/orbit-mock-worker src-tauri/binaries/orbit-mock-worker-x86_64-unknown-linux-gnu
           chmod +x src-tauri/binaries/*
 
@@ -73,8 +83,11 @@ jobs:
 
       - name: Build Tauri AppImage
         run: |
-          cd src-tauri && cargo tauri build --bundles appimage --ci || cd .. && cargo tauri build --bundles appimage --ci
-        continue-on-error: true
+          cd src-tauri
+          APPIMAGE_EXTRACT_AND_RUN=1 cargo tauri build --bundles appimage --ci
+          test -d target/release/bundle/appimage
+          find target/release/bundle/appimage -type f -name '*.AppImage' | grep -q .
+
 
       - name: Build portable fallback (tar.gz)
         run: |
@@ -112,13 +125,15 @@ jobs:
           cp packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz.sha256 artifacts/ 2>/dev/null || true
           (cd artifacts && sha256sum * > SHA256SUMS 2>/dev/null || true)
           ls -la artifacts/
+          find artifacts -maxdepth 1 -type f -name '*.AppImage' | grep -q . || { echo 'ERROR: AppImage missing after successful build'; exit 1; }
+          test -s artifacts/SHA256SUMS
 
       - name: Upload artifacts (workflow)
         uses: actions/upload-artifact@v4
         with:
           name: NightKnight-ORBIT-Desktop-Linux
           path: artifacts/*
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: CI smoke (Python tests)
         run: |

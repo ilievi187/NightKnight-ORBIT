@@ -29,6 +29,8 @@ function chooseProfile(profile) {
   $('profileName').textContent = profile + ' ●';
   $('profileDescription').textContent = descriptions[profile];
   document.querySelectorAll('.planet').forEach(p => p.classList.toggle('active', p.dataset.profile === profile));
+  document.body.dataset.orbitProfile = profile;
+  window.ORBIT_COSMOS?.setProfile(profile);
 }
 async function loadSessions() {
   const sessions = await api('/api/sessions');
@@ -65,6 +67,7 @@ function render(detail) {
     wrap.append(mark,element('div','intro-kicker','WELCOME TO THE ORBIT'));
     const h2=element('h2','');h2.append(document.createTextNode('Един контролен център.'));h2.append(document.createElement('br'));h2.append(element('em','','Неограничени възможности.'));
     wrap.append(h2,element('p','','ALEX, NOVA и HERMES са готови. Започни с първата си мисия.'));
+    window.ORBIT_COSMOS?.mount(wrap, profile => createSession(profile).catch(err => banner(err.message)));
     target.append(wrap);
   }
   for (const msg of detail.messages || []) {
@@ -189,6 +192,8 @@ async function sendMessage(event) {
   } finally {setBusy(false);$('message').focus();}
 }
 async function boot() {
+  chooseProfile('ALEX');
+  window.ORBIT_COSMOS?.mount(document.querySelector('.messages .intro'), profile => createSession(profile).catch(err => banner(err.message)));
   $('composer').addEventListener('submit',sendMessage);
   $('newSession').addEventListener('click',()=>createSession().catch(err=>banner(err.message)));
   $('message').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();$('composer').requestSubmit();}});

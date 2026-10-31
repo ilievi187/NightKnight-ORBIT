@@ -1,0 +1,109 @@
+/* COSMOS cinematic scene is progressive enhancement: chat and approvals remain untouched. */
+.intro{max-width:min(100%,780px);width:100%}
+.intro .intro-mark{font-size:36px}
+.cosmos-scene{
+  position:relative;isolation:isolate;overflow:hidden;width:100%;
+  height:clamp(250px,34vh,365px);margin:22px auto 8px;
+  border:1px solid rgba(144,135,226,.35);border-radius:18px;
+  background:
+    radial-gradient(ellipse at 49% 52%,rgba(4,8,23,.10),rgba(4,7,18,.45) 72%),
+    url('/assets/cosmos/cosmos_alex_background.png') center 55%/cover,
+    radial-gradient(ellipse at 28% 35%,#6d2790,#130d2f 65%,#070c19);
+  box-shadow:0 24px 85px rgba(0,0,0,.4),inset 0 0 75px rgba(21,16,55,.2)
+}
+.cosmos-scene[data-profile="NOVA"]{
+  background:
+    radial-gradient(ellipse at 49% 52%,rgba(4,8,23,.11),rgba(4,7,18,.40) 72%),
+    url('/assets/cosmos/cosmos_nova_background.png') center 55%/cover,
+    radial-gradient(ellipse at 28% 35%,#225c9c,#131b43 65%,#070c19)
+}
+.cosmos-scene[data-profile="HERMES"]{filter:saturate(.83)}
+.cosmos-scene:before{
+  content:"";position:absolute;inset:0;pointer-events:none;z-index:2;
+  background:linear-gradient(90deg,rgba(3,5,16,.25),transparent 42%,rgba(3,5,16,.14));
+  box-shadow:inset 0 0 65px #05091e;
+}
+.cosmos-canvas{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none;z-index:1}
+.cosmos-nav{
+  display:flex;gap:8px;position:absolute;left:50%;bottom:30px;
+  transform:translateX(-50%);z-index:3;
+}
+.cosmos-agent{
+  color:#eff4ff;background:rgba(6,12,30,.79);backdrop-filter:blur(10px);
+  border:1px solid rgba(154,180,249,.52);border-radius:24px;
+  padding:9px 17px;letter-spacing:.13em;font-size:10px;font-weight:800;
+  transition:background .2s,border-color .2s,transform .2s
+}
+.cosmos-agent:hover,.cosmos-agent:focus-visible{transform:translateY(-2px);background:rgba(35,41,86,.96)}
+.cosmos-agent[aria-pressed="true"]{border-color:#cfc5ff;background:rgba(75,64,141,.87);box-shadow:0 0 20px #635cbd77}
+.cosmos-caption{
+  position:absolute;z-index:3;top:15px;left:17px;
+  font:700 9px/1.6 ui-monospace,monospace;letter-spacing:.19em;color:#bac9f9;
+  text-shadow:0 1px 8px #06091c
+}
+.cosmos-fallback{display:none;position:absolute;inset:0;pointer-events:none;z-index:1}
+.cosmos-scene.webgl-unavailable .cosmos-canvas{display:none}
+.cosmos-scene.webgl-unavailable .cosmos-fallback{display:block}
+.cosmos-fallback-orb{
+  position:absolute;display:block;border-radius:50%;box-shadow:inset -22px -15px 26px #020815,0 0 28px #6286d63a
+}
+.cosmos-fallback-orb.orb-0{
+  width:180px;height:180px;left:18%;top:19%;
+  background:url('/assets/cosmos/planet_violet_texture.png') center/cover,
+    radial-gradient(circle at 28% 28%,#a27aff,#3f287d 62%,#111130)
+}
+.cosmos-fallback-orb.orb-1{
+  width:100px;height:100px;right:24%;top:14%;
+  background:url('/assets/cosmos/planet_blue_texture.png') center/cover,
+    radial-gradient(circle at 28% 28%,#8fe7f0,#205a9a 62%,#061a35)
+}
+.cosmos-fallback-orb.orb-2{
+  width:73px;height:73px;right:16%;bottom:15%;
+  background:url('/assets/cosmos/planet_amber_texture.png') center/cover,
+    radial-gradient(circle at 28% 28%,#ffd287,#a55d35 62%,#4d2034)
+}
+.cosmos-fallback-orb.orb-3{
+  width:53px;height:53px;left:14%;top:9%;
+  background:url('/assets/cosmos/planet_moon_texture.png') center/cover,
+    radial-gradient(circle at 28% 28%,#dce1ea,#687387 62%,#232c3a)
+}
+/* The original right-panel controls remain native buttons, not a canvas hit map. */
+.universe{
+  background:radial-gradient(ellipse at center,rgba(9,10,28,.36),rgba(7,9,26,.76)),
+    url('/assets/cosmos/cosmos_alex_background.png') center/cover,
+    radial-gradient(ellipse at 30% 30%,#382053,#080e1c 76%);
+  border-radius:12px;border:1px solid #33335380
+}
+body[data-orbit-profile="NOVA"] .universe{
+  background:radial-gradient(ellipse at center,rgba(9,10,28,.4),rgba(7,9,26,.75)),
+    url('/assets/cosmos/cosmos_nova_background.png') center/cover,
+    radial-gradient(ellipse at 30% 30%,#17476f,#080e1c 76%)
+}
+.planet.alex{
+  background:radial-gradient(circle at 26% 22%,#ffffff4d,transparent 50%),
+    url('/assets/cosmos/planet_violet_texture.png') center/cover,
+    radial-gradient(circle at 25% 25%,#9b83e3,#282151)
+}
+.planet.nova{
+  background:radial-gradient(circle at 26% 22%,#ffffff55,transparent 50%),
+    url('/assets/cosmos/planet_blue_texture.png') center/cover,
+    radial-gradient(circle at 25% 25%,#86dce6,#214e7c)
+}
+.planet.hermes{
+  background:radial-gradient(circle at 26% 22%,#ffffff55,transparent 50%),
+    url('/assets/cosmos/planet_amber_texture.png') center/cover,
+    radial-gradient(circle at 25% 25%,#f0c28d,#653a2c)
+}
+.planet{box-shadow:inset -9px -7px 13px #0009,0 0 18px #5f5abe38}
+.planet.active{box-shadow:inset -9px -7px 13px #0008,0 0 0 4px #9180df34,0 0 26px #9385fdad}
+@media(max-width:650px){
+  .intro{padding:10px 0}
+  .cosmos-scene{height:245px;margin-top:14px}
+  .cosmos-agent{padding:8px 11px;font-size:9px}
+  .cosmos-nav{gap:5px;bottom:17px}
+  .cosmos-caption{font-size:8px}
+  .cosmos-fallback-orb.orb-0{width:130px;height:130px}
+  .cosmos-fallback-orb.orb-1{width:75px;height:75px}
+  .cosmos-fallback-orb.orb-2{width:54px;height:54px}
+}
+@media(prefers-reduced-motion:reduce){.cosmos-agent{transition:none}}

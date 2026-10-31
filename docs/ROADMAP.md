@@ -38,6 +38,8 @@
 - [ ] Full-screen voice ALEX/NOVA, lip-synced avatar and STT/TTS
 - [ ] Opt-in browser and desktop control with clear live indicators
 - [ ] Screen/video playback / workstation mission board
-- [ ] Benchmarks against OpenCode, OpenHands, Claude Agent SDK
+- [ ] Benchmarks against OpenCode, OpenHands, Claude Agent SDK, Orca (stablyai/orca) and Orca Agent Engine
+- [ ] Evaluate Orca-inspired isolated agent worktrees, SSH remote workers, inline diff reviews, task persistence and recovery (see #8)
+- [ ] Assess optional mobile monitoring and browser design-mode workflows after core agent permissions are hardened
 
 **Release gate:** A feature is not declared complete without integration tests on the actual hosts and manual verification of OS permissions.

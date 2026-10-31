@@ -3,7 +3,7 @@
 ORBIT is an independent, local-first AI-agent harness. Existing ALEX, NOVA, Hermes, AURORA and the NightKnight dashboards are not part of this codebase. Do not modify their files or runtime services without a separately reviewed integration plan.
 
 ## First steps on every mission
-1. Read `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and your assigned mission in `docs/agents/MISSIONS.md`.
+1. Read `docs/ORBIT-NORTH-STAR.md` **first** (the product contract), then `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and your assigned mission in `docs/agents/MISSIONS.md`. The current prototype is not the finished supervisor.
 2. Make a small feature branch dedicated to one mission; do not mix unrelated changes.
 3. Run `python -m unittest discover -s tests -v` before and after every change.
 4. Add tests for new behavior; never mark a mission complete using only an AI-written summary.

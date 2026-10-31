@@ -120,6 +120,11 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
                     "probed_model": diag.get("selected_model"),
                     "probe_status": diag.get("selected_status"),
                     "probe_latency_ms": diag.get("selected_latency_ms"),
+                    # Backward-compatible keys for M3 clients. All remain probe-only,
+                    # never imply the Harness chat route has switched providers.
+                    "selected_provider": diag.get("selected"),
+                    "selected_status": diag.get("selected_status"),
+                    "selected_latency_ms": diag.get("selected_latency_ms"),
                     "provider_count": diag.get("provider_count"),
                     "note": "Probe metadata only; ORBIT chat still uses configured Harness provider.",
                 }}

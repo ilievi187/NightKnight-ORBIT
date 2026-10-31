@@ -40,13 +40,13 @@ The app opens the dashboard at `http://127.0.0.1:8765`. The backend **only binds
 
 1. Open the **MISSIONS** tab → **LAUNCH DEMO MISSION** (real supervisor, persistent SQLite state)
 2. Open the **FLEET** tab → **GENERATE PAIRING** (single-use, short-lived, hashed at rest)
-3. Run the real mock worker:
+3. Run the real mock worker (supply its one-time pairing code on stdin; never in command arguments):
 ```bash
 # In portable bundle:
-./bin/orbit-mock-worker --api http://127.0.0.1:8765 --pairing <CODE> --workdir ./orbit-demo --flaky-retry 1
+./bin/orbit-mock-worker --api http://127.0.0.1:8765 --pairing-stdin --workdir ./orbit-demo --flaky-retry 1
 
 # Or from source in this repo:
-.venv/bin/python tools/mock-worker.py --api http://127.0.0.1:8765 --pairing <CODE> --workdir ./orbit-demo --flaky-retry 1
+.venv/bin/python tools/mock-worker.py --api http://127.0.0.1:8765 --pairing-stdin --workdir ./orbit-demo --flaky-retry 1
 ```
 
 The supervisor advances on registration/heartbeat. Verification checks **actual files on disk** (worker self-claims never pass/fail). A blocked task with a scoped grant denial does **not** gate completion.

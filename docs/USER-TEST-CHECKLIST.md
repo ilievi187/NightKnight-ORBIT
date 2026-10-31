@@ -16,7 +16,7 @@ Run this against a downloaded AppImage or portable build.
 ## Worker Pairing & Fleet
 - [ ] **FLEET** tab: **GENERATE PAIRING** shows a **one-shot** code with expiry countdown
 - [ ] Pairing stored hashed (not visible in logs/journal). Journal shows event without code/hash.
-- [ ] Run real mock worker: `orbit-mock-worker --api http://127.0.0.1:8765 --pairing <CODE> ...`
+- [ ] Run real mock worker: `orbit-mock-worker --api http://127.0.0.1:8765 --pairing-stdin (code entered on stdin) ...`
 - [ ] **FLEET** lists worker as **LIVE/IDLE** (only real registered worker; profiles ALEX/NOVA/HERMES remain separate)
 - [ ] Heartbeats update; no fabricated metrics
 

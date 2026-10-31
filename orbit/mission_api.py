@@ -320,7 +320,7 @@ def build_mission_router(supervisor: Supervisor, fleet: Fleet, *, enable_tick: b
         args = [
             *command,
             "--api", f"http://127.0.0.1:{os.getenv('ORBIT_PORT', '8765')}",
-            "--pairing", pairing["pairing_code"],
+            "--pairing-stdin",
             "--name", "DEMO-MockWorker",
             "--kind", "mock",
             "--capability", supervisor.capability_name(),
@@ -332,8 +332,16 @@ def build_mission_router(supervisor: Supervisor, fleet: Fleet, *, enable_tick: b
         log_path = Path(supervisor.store.filename).parent / "demo-worker.log"
         try:
             with open(log_path, "ab") as log:
-                proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT,
+                proc = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                        stdout=log, stderr=subprocess.STDOUT,
                                         env=env, start_new_session=True)
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write((pairing["pairing_code"] + "\n").encode("utf-8"))
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError) as exc:
+                    proc.kill()
+                    raise OSError(f"worker failed secure pairing handoff: {exc}") from exc
         except OSError as exc:
             raise HTTPException(503, f"demo worker could not start: {exc}") from exc
         return {

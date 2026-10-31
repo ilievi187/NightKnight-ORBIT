@@ -234,9 +234,17 @@ class DemoLaunchTests(MissionApiBase):
         self.assertEqual(response.status_code, 201, response.text)
         args = popen.call_args[0][0]
         self.assertEqual(args[1], str(script), "launcher must not run user-supplied commands")
-        self.assertTrue(any(a == "--pairing" for a in args))
+        self.assertIn("--pairing-stdin", args)
+        self.assertNotIn("--pairing", args)
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+        self.assertTrue(popen.return_value.stdin.write.called)
+        secret = popen.return_value.stdin.write.call_args.args[0].decode().strip()
+        self.assertTrue(secret)
+        self.assertNotIn(secret, " ".join(args))
+        self.assertTrue(popen.return_value.stdin.close.called)
 
 
+import subprocess
 import unittest.mock  # noqa: E402  (placed here intentionally after imports)
 
 

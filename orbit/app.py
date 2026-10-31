@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .storage import Storage
 from .harness import Harness, PROFILES, ProviderError
+from .runtime import build_runtime, ProviderChatError
 
 WEB_DIR = Path(__file__).parent.parent / "web"
 
@@ -27,12 +28,25 @@ class ApprovalDecision(BaseModel):
     approve: bool
 
 
+class ProbeRequest(BaseModel):
+    providers: list[str] | None = None
+
+
+class BenchmarkRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    prompt: str = Field(default="Reply with a single short word.", max_length=400)
+    max_tokens: int = Field(default=32, ge=1, le=512)
+
+
 def create_app(settings: Settings | None = None, client: httpx.Client | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
     store = Storage(settings.database)
     engine = Harness(settings, store, client=client)
+    runtime = build_runtime(settings, client=client)
     app = FastAPI(title="NightKnight ORBIT", version="0.1.0", docs_url="/api/docs", redoc_url=None)
     app.state.engine = engine
+    app.state.runtime = runtime
     # Reject DNS rebinding attempts against the loopback-only service.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")
@@ -60,12 +74,54 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "version": "0.1.0", "provider_status": "not_checked", "model": settings.model,
-                "base_url": settings.base_url, "workspace": str(settings.workspace), "write_policy": "human_approval"}
+        diag = runtime.status()  # last-known only; no network I/O
+        return {
+            "status": "ok",
+            "version": "0.1.0",
+            "provider_status": diag.get("selected_status") or "not_checked",
+            "model": diag.get("selected_model") or settings.model,
+            "base_url": settings.base_url,
+            "workspace": str(settings.workspace),
+            "write_policy": "human_approval",
+            "runtime": {
+                "selected_provider": diag.get("selected"),
+                "selected_status": diag.get("selected_status"),
+                "selected_latency_ms": diag.get("selected_latency_ms"),
+                "provider_count": diag.get("provider_count"),
+            },
+        }
 
     @app.get("/api/agents")
     def agents():
         return [{"id": key, "description": val} for key, val in PROFILES.items()]
+
+    @app.get("/api/runtime")
+    def runtime_status():
+        """Last-known inference runtime state. Performs no network I/O."""
+        return runtime.status()
+
+    @app.post("/api/runtime/probe")
+    def runtime_probe(payload: ProbeRequest):
+        """Actively probe providers (read-only: models list + optional version)."""
+        try:
+            return runtime.probe(payload.providers)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/runtime/benchmark")
+    def runtime_benchmark(payload: BenchmarkRequest):
+        """Opt-in, single timed completion. tokens_per_s only if the server reports usage."""
+        try:
+            return runtime.benchmark(
+                payload.provider,
+                payload.model,
+                prompt=payload.prompt,
+                max_tokens=payload.max_tokens,
+            )
+        except ProviderChatError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/sessions")
     def sessions():

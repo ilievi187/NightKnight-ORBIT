@@ -119,6 +119,54 @@ function setBusy(value) {
   busy=value;$('send').disabled=value || requiresApproval;
   $('send').textContent=value?'РАБОТИ...':'ИЗПРАТИ ↗';
 }
+// --- inference runtime telemetry (M3) --------------------------------------
+function fmtMs(value) { return value == null ? 'n/a' : `${Math.round(value)} ms`; }
+function renderRuntime(data) {
+  const providers = data.providers || [];
+  const sel = providers.find(p => p.status === 'READY') || providers[0] || null;
+  if (!sel) return;
+  $('provider').textContent = sel.provider + ' · ' + sel.kind;
+  const statusEl = $('runtimeStatus');
+  statusEl.textContent = sel.status;
+  statusEl.className = 'status-' + String(sel.status).toLowerCase();
+  $('runtimeLatency').textContent = fmtMs(sel.latency_ms);
+  const models = sel.available_models || [];
+  $('runtimeModels').textContent = models.length
+    ? models.slice(0, 3).join(', ') + (models.length > 3 ? ` +${models.length - 3}` : '')
+    : 'none';
+  const err = sel.error;
+  const errEl = $('runtimeError');
+  errEl.hidden = !err;
+  if (err) errEl.textContent = err;
+  if (data.selected) $('model').textContent = sel.model || data.selected_model || $('model').textContent;
+}
+async function refreshRuntime() {
+  try {
+    const data = await api('/api/runtime');
+    renderRuntime(data);
+  } catch (e) { /* telemetry is best-effort; banner stays for chat errors */ }
+}
+async function probeRuntime() {
+  if (busy) return;
+  $('probeBtn').disabled = true;
+  try {
+    const data = await api('/api/runtime/probe', { method: 'POST', body: JSON.stringify({}) });
+    renderRuntime(data);
+  } catch (e) {
+    banner('PROBE: ' + e.message);
+  } finally { $('probeBtn').disabled = false; }
+}
+async function benchRuntime() {
+  if (busy) return;
+  $('benchBtn').disabled = true;
+  try {
+    const data = await api('/api/runtime/benchmark', { method: 'POST', body: JSON.stringify({}) });
+    const tps = data.tokens_per_s_available ? `${data.tokens_per_s} tok/s` : 'throughput: n/a (server did not report usage)';
+    banner(`BENCH · ${data.model || '?'} · ${(data.elapsed_s * 1000).toFixed(0)} ms · ${tps}`);
+  } catch (e) {
+    banner('BENCH: ' + e.message);
+  } finally { $('benchBtn').disabled = false; }
+}
 async function sendMessage(event) {
   event.preventDefault();
   const content=$('message').value.trim();
@@ -145,6 +193,8 @@ async function boot() {
   $('newSession').addEventListener('click',()=>createSession().catch(err=>banner(err.message)));
   $('message').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();$('composer').requestSubmit();}});
   document.querySelectorAll('.planet').forEach(planet=>planet.addEventListener('click',()=>createSession(planet.dataset.profile).catch(err=>banner(err.message))));
+  $('probeBtn').addEventListener('click',()=>probeRuntime());
+  $('benchBtn').addEventListener('click',()=>benchRuntime());
   try {
     const health=await api('/api/health');
     $('model').textContent=health.model;
@@ -152,6 +202,7 @@ async function boot() {
     $('workspace').textContent=health.workspace;
     $('provider').textContent='Not probed';
     $('version').textContent='v'+health.version;
+    await refreshRuntime();
     const remembered=window.localStorage.getItem('orbit_session');
     if (remembered) {
       try {await loadSession(remembered);return;}catch {window.localStorage.removeItem('orbit_session');}

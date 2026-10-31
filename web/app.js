@@ -444,14 +444,42 @@ function runtimePanel(data) {
     target.append(offline);
     return;
   }
-  const status = data && (data.status ?? data.state) || 'unknown';
-  target.append(element('div','task-meta', 'runtime status: ' + status));
+  const providers = Array.isArray(data.providers) ? data.providers : [];
+  target.append(element('div','task-meta',
+    'PROBED MODEL ENDPOINTS · ' + providers.length + ' · NOT THE ACTIVE CHAT ROUTE'));
+  if (!providers.length) {
+    target.append(element('div','runtime-offline','Няма конфигуриран inference provider.'));
+    return;
+  }
+  for (const provider of providers) {
+    const card = element('div','mission-col');
+    card.append(element('div','aside-label',
+      (provider.provider || 'unknown') + ' · ' + (provider.kind || '?')));
+    const tone = provider.status === 'READY' ? 'green' :
+      provider.status === 'ERROR' || provider.status === 'OFFLINE' ? 'red' : 'amber';
+    const facts = [
+      ['PROBE STATUS', provider.status || 'NOT_CHECKED'],
+      ['MODEL CONFIG', provider.model || 'unavailable'],
+      ['LATENCY', typeof provider.latency_ms === 'number' ? provider.latency_ms.toFixed(1) + ' ms' : 'unavailable'],
+      ['DISCOVERED MODELS', (provider.available_models || []).join(', ') || 'unavailable'],
+      ['ERROR', provider.error || 'none']
+    ];
+    for (const [name, value] of facts) {
+      const row = element('div','metric');
+      row.append(element('span','',name), element('strong',name === 'PROBE STATUS' ? tone : '', String(value)));
+      card.append(row);
+    }
+    target.append(card);
+  }
+  target.append(element('div','task-meta',
+    'READY означава, че API отговаря на списъка с модели — не че моделът е зареден или чатът го използва.'));
 }
 async function probeRuntime() {
   banner('', 'systemBanner');
   try {
     const result = await api('/api/runtime/probe', {method:'POST', body:'{}'});
-    banner('Probe: ' + JSON.stringify(result).slice(0, 160), 'systemBanner');
+    runtimePanel(result);
+    banner('Model endpoint probe completed (not an active chat switch).', 'systemBanner');
   } catch (e) {
     banner(e.status === undefined && /HTTP 404/.test(String(e.message)) ?
       '/api/runtime/probe отсъства — PR #7 (M3) не е обединен.' : 'Probe: ' + e.message, 'systemBanner');
@@ -461,7 +489,8 @@ async function benchRuntime() {
   banner('', 'systemBanner');
   try {
     const result = await api('/api/runtime/benchmark', {method:'POST', body:'{}'});
-    banner('Benchmark: ' + JSON.stringify(result).slice(0, 160), 'systemBanner');
+    const rate = typeof result.tokens_per_s === 'number' ? result.tokens_per_s + ' tokens/s' : 'throughput unavailable';
+    banner('BENCHMARK · ' + (result.provider || '?') + ' · ' + rate, 'systemBanner');
   } catch (e) {
     banner(/HTTP 404/.test(String(e.message)) ?
       '/api/runtime/benchmark отсъства — PR #7 (M3) не е обединен.' : 'Benchmark: ' + e.message, 'systemBanner');

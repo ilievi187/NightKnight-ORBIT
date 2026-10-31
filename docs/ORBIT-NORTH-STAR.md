@@ -25,6 +25,46 @@ The supervisor **does not have to do the actual coding or browsing**. It is resp
 
 **"All brains as one" means shared coordination, memory and tool contracts, not merging model weights or pretending different subscriptions are interchangeable.** Maintain explicit identities and measured capabilities for each provider/agent.
 
+## The mandatory self-improving mission loop (user-defined product invariant)
+
+**Not a one-shot plan.** Every mission executes the entire cycle repeatedly until objective acceptance criteria are met or a bounded, explicit blocker requires intervention.
+
+```text
+USER GOAL
+   ↓
+1. ANALYZE GOAL            → observable scope, requirements, Definition of Done
+   ↓
+2. INVENTORY AVAILABILITY  → real models/APIs, agent processes, hosts, tools,
+                             context, permissions, VRAM, spend limits
+   ↓
+3. EVALUATE CAPABILITIES   → tested/observed skills of each worker + brain;
+                             capability-confidence and failure history
+   ↓
+4. BUILD PROJECT SKELETON → workspace/repo structure, interfaces, phases,
+                             dependencies, acceptance tests and deliverables
+   ↓
+5. ASSIGN + EXECUTE        → schedule eligible agents, isolated worktrees,
+                             verified task inputs/outputs
+   ↓
+6. VERIFY PROGRESS         → run acceptance tests, inspect artifacts,
+                             compare whole-project state against goal
+   ↓
+7. GAP ANALYSIS            → missing requirements? bugs? integration failures?
+   ├─ YES → revise plan, re-score available agents, reassign gaps,
+   │         execute new tasks, verify AGAIN (repeat from 2/3 as needed)
+   ├─ BLOCKED → keep independent tasks running; request ONLY the specific
+   │            new grant/decision/resource needed for blocked tasks
+   └─ NO  → final independent project-level verification → COMPLETE
+```
+
+**Project readiness, not just task completion:** an agent finishing its assigned work does **not** mean the project is done. The supervisor re-inspects the combined artifact, interfaces, tests, UX and all originally requested features after every iteration. Project skeleton is established early and evolves when evidence exposes new constraints.
+
+**Completion contract:** `readiness = 100%` means all tracked, testable acceptance requirements are satisfied by evidence (not an LLM's self-rating); mandatory security and integration gates pass; there are no critical unresolved gaps; results are reproducible. Show a truthful partial score, `BLOCKED`, or `UNKNOWN` when proof is missing. There is no guarantee of literal perfection.
+
+**Anti-stall control:** each iteration has an ID, plan revision, work budget, retry cap, success/failure events and changed-state diff. Detect no-progress loops, repeated failed approaches, expired permits, offline workers and depleted quotas. Replan or escalate **one concrete blocker** instead of endlessly retrying or pausing unrelated work. Persist the whole mission across restarts, including approvals.
+
+**Example:** User requests a complete AURORA site. ALEX finishes backend, HERMES fixes model integration, NOVA verifies information architecture, LUNA runs independent E2E/security checks; supervisor discovers case pages lack embedded video, creates focused follow-up tasks, and loops until the defined video, language, data and UX acceptance tests pass — not until a worker merely says “done”.
+
 ## Core experience: autonomous Plan Mode
 
 1. **Understand the goal** and inspect the authorized project, its tests and current task state.

@@ -1,0 +1,11 @@
+:root {color-scheme: dark;font-family: Inter, system-ui, sans-serif}
+*{box-sizing:border-box}body{background:radial-gradient(ellipse at 50% 35%,#271647 0,#0c0b17 47%,#060810 85%);color:#eae7ff;margin:0;min-height:100vh;display:grid;place-items:center}
+.boot{width:min(640px,92vw);text-align:center;padding:64px 24px;border:1px solid #30244a;border-radius:22px;background:rgba(10,10,22,.7);box-shadow:0 0 100px rgba(111,65,187,.1)}
+.ring{height:112px;width:112px;border:1px solid #7257ca;border-radius:50%;display:grid;place-items:center;margin:0 auto 30px;box-shadow:0 0 35px #6940bd60,inset 0 0 30px #291a50;animation:pulse 2s ease-in-out infinite alternate}
+.core{font-size:58px;color:#bba5ff}
+.eyebrow{font-size:11px;letter-spacing:.27em;color:#a99cc7}
+h1{font-weight:650;font-size:clamp(26px,4vw,38px);margin:17px 0 18px}
+#boot-status{font-size:15px;min-height:50px;color:#b3d8fa;overflow-wrap:anywhere;white-space:pre-line}
+.hint{font-size:13px;color:#c0b4db}
+.detail{font-size:12px;color:#877d9f;margin-top:40px}
+@keyframes pulse{to{box-shadow:0 0 70px #6940bd88,inset 0 0 55px #453071;transform:scale(1.03)}}

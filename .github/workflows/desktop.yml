@@ -65,6 +65,10 @@ jobs:
           pyinstaller packaging/orbit-appimage-server.spec --noconfirm --distpath dist/appimage
           test -x dist/appimage/orbit-server
 
+      - name: Smoke test actual frozen backend with HTML/CSS/JS
+        run: |
+          python tools/smoke_orbit_sidecar.py dist/appimage/orbit-server
+
       - name: Generate self-contained ORBIT desktop icons
         run: |
           python tools/generate_desktop_icons.py

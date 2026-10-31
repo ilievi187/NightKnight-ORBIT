@@ -64,3 +64,22 @@ The supervisor advances on registration/heartbeat. Verification checks **actual 
 - Worker tokens are 256-bit, hashed at rest, never logged/exposed.
 - Writing requires human approval in the chat flow (separate from worker artifact submission).
 - CSP enforced by the server/UI.
+
+## Native AppImage startup troubleshooting
+
+The AppImage initially shows a **Starting Mission Control** screen. This is
+intentional: the ORBIT UI CSS/JS is served by the packaged Python backend at
+`127.0.0.1:8765`. If the backend fails, a diagnostic is displayed instead of
+an unstyled fake dashboard. The terminal also receives `ORBIT_BACKEND_STDERR`
+lines and the exit code.
+
+- `ORBIT_PORT_BUSY`: close only the existing *loopback ORBIT* process before relaunch.
+- `ORBIT_BACKEND_STDERR`: actual frozen Python/uvicorn error, unlike harmless GTK accessibility warnings.
+- `curl http://127.0.0.1:8765/api/health`: should report the configured `ORBIT_MODEL`
+  and `ORBIT_BASE_URL` once native launch completes.
+- CI now executes the actual PyInstaller onefile backend and verifies `/api/health`,
+  `/`, `/assets/style.css`, and `/assets/app.js`. Packaging alone is not a launch test.
+- Full AppImage/Wayland smoke still requires checking on NightKnightPC.
+
+Do not kill the Heretic llama-server on port `18879` or the separate
+Tailscale-bound review service on `100.115.247.63:8765`.

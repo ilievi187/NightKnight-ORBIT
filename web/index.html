@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07080e">
+  <meta name="description" content="NightKnight ORBIT — local-first AI agent harness">
+  <title>NightKnight ORBIT · Mission Control</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div id="app" class="shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-symbol">◎</div><div><strong>NIGHTKNIGHT</strong><span>ORBIT / HARNESS 0.1</span></div></div>
+      <button class="new-mission" id="newSession">+ &nbsp; НОВА МИСИЯ</button>
+      <div class="aside-label">АКТИВНИ МИСИИ</div>
+      <div id="sessions" class="session-list" aria-label="Сесии"></div>
+      <div class="aside-bottom"><div class="status-dot"></div><span>LOCAL ENGINE ONLINE</span><small id="version">v0.1.0</small></div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div><div class="eyebrow">MISSION CONTROL <span class="separator">/</span> <span id="activeProfile">ALEX</span></div><h1 id="missionTitle">Нова мисия</h1></div>
+        <div class="top-pill"><span class="green-circle"></span> LOCAL-FIRST <span class="top-divider">|</span><span id="modelShort">MODEL</span></div>
+      </header>
+      <section class="messages" id="messages" aria-live="polite">
+        <div class="intro"><div class="intro-mark">◎</div><div class="intro-kicker">WELCOME TO THE ORBIT</div><h2>Един контролен център.<br><em>Неограничени възможности.</em></h2><p>ALEX, NOVA и HERMES са готови за мисии. Избери агент, задай задача и контролирай всяко действие.</p></div>
+      </section>
+      <section id="approvals" class="approvals" aria-live="assertive"></section>
+      <div id="banner" class="banner" role="status" hidden></div>
+      <form id="composer" class="composer">
+        <label for="message" class="sr-only">Въведи задача</label>
+        <textarea id="message" rows="2" placeholder="Задай мисия на агента..." maxlength="10000" required></textarea>
+        <div class="composer-bottom"><span>TOOLS: READ AUTO · WRITE APPROVAL</span><button type="submit" id="send">ИЗПРАТИ ↗</button></div>
+      </form>
+      <div class="footnote">ORBIT DOES NOT EXECUTE SYSTEM COMMANDS IN V0.1 · YOU APPROVE EVERY FILE CHANGE</div>
+    </main>
+    <aside class="right-panel">
+      <div class="right-heading"><span class="eyebrow">AGENT CONSTELLATION</span><span class="live-indicator">● LIVE</span></div>
+      <div class="universe" aria-label="Избор на агент">
+        <div class="orbit-ring ring-1"></div><div class="orbit-ring ring-2"></div>
+        <div class="star s1"></div><div class="star s2"></div><div class="star s3"></div><div class="star s4"></div><div class="star s5"></div><div class="star s6"></div>
+        <div class="core"><div class="core-inner">◎</div><span>ORBIT</span></div>
+        <button class="planet alex active" data-profile="ALEX"><span>⌘</span><small>ALEX</small></button>
+        <button class="planet nova" data-profile="NOVA"><span>✦</span><small>NOVA</small></button>
+        <button class="planet hermes" data-profile="HERMES"><span>◇</span><small>HERMES</small></button>
+      </div>
+      <div class="agent-details"><span class="muted">ACTIVE PROFILE</span><h3 id="profileName">ALEX <span>●</span></h3><p id="profileDescription">Engineering & development</p></div>
+      <div class="section-line"></div>
+      <div class="right-heading"><span class="eyebrow">SYSTEM TELEMETRY</span><span class="muted">v0.1</span></div>
+      <div class="metric"><span>MODEL</span><strong id="model">--</strong></div>
+      <div class="metric"><span>WORKSPACE</span><strong id="workspace">--</strong></div>
+      <div class="metric"><span>PROVIDER</span><strong id="provider">Not checked</strong></div>
+      <div class="metric"><span>WRITE PERMISSION</span><strong class="amber">ASK FIRST</strong></div>
+      <div class="section-line"></div>
+      <div class="right-heading"><span class="eyebrow">ACTION JOURNAL</span></div>
+      <div id="audit" class="audit"><div class="muted">Няма изпълнени инструменти.</div></div>
+    </aside>
+  </div>
+</body>
+</html>

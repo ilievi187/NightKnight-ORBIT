@@ -1,0 +1,23 @@
+name: Agent mission
+about: Scoped coding-agent task for ORBIT
+labels: [agent-task]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Precise, verifiable outcome
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Tests and observable checks
+    validations:
+      required: true
+  - type: textarea
+    id: permissions
+    attributes:
+      label: Permissions and prohibited changes
+      value: No secrets, no deployment, no unapproved shell or multi-host actions.

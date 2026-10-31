@@ -28,7 +28,6 @@ hiddenimports = [
     'orbit.fleet',
     'orbit.planmode',
     'orbit.mission_api',
-    'orbit.server',
     'uvicorn.logging',
     'uvicorn.loops.auto',
     'uvicorn.protocols.http.auto',

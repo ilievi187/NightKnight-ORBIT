@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
@@ -135,7 +136,10 @@ def execute_task(task: dict, workdir, flaky_left: list[int]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="ORBIT mock worker (real process)")
     parser.add_argument("--api", default=DEFAULTS["api"])
-    parser.add_argument("--pairing", required=True)
+    parser.add_argument("--pairing", help=argparse.SUPPRESS)  # reject insecure argv secret
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--pairing-stdin", action="store_true", help="Read a single-use code from stdin")
+    source.add_argument("--pairing-file", help="Read code from an owner-only 0600 file")
     parser.add_argument("--name", default="MockWorker")
     parser.add_argument("--kind", default="mock", choices=["mock", "hermes", "opencode", "custom"])
     parser.add_argument("--host", default=socket.gethostname())
@@ -148,13 +152,29 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=float, default=DEFAULTS["max_seconds"])
     parser.add_argument("--version", default="0.1")
     args = parser.parse_args()
+    if args.pairing is not None:
+        parser.error("--pairing in argv is forbidden (exposes credentials to ps/history); use --pairing-stdin")
+    if args.pairing_stdin:
+        pairing_code = sys.stdin.readline().strip()
+    elif args.pairing_file:
+        p = Path(args.pairing_file).expanduser()
+        if p.is_symlink() or not p.is_file():
+            parser.error("pairing file must be a regular, non-symlink file")
+        info = p.stat()
+        if info.st_mode & 0o077 or info.st_uid != os.getuid():
+            parser.error("pairing file must be owned by the current user with mode 0600")
+        pairing_code = p.read_text(encoding="utf-8").strip()
+    else:
+        parser.error("a pairing source is required (--pairing-stdin or --pairing-file)")
+    if not pairing_code:
+        parser.error("empty pairing code")
 
     workdir = Path(args.workdir or ".").resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     flaky_left = [max(0, int(args.flaky_retry))]
     capabilities = args.capability or ["orbit.plan.deliver"]
     status, data = http_call(args.api, f"/api/workers/v0.1/register", {
-        "pairing_code": args.pairing, "name": args.name, "host": args.host,
+        "pairing_code": pairing_code, "name": args.name, "host": args.host,
         "kind": args.kind, "capabilities": capabilities, "version": args.version})
     if status != 201:
         print(f"[mock-worker] registration denied: HTTP {status}: {data.get('detail')}", file=sys.stderr)

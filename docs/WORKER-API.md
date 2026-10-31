@@ -4,7 +4,7 @@ Versioned under `/api/workers/v0.1`. Only callable from loopback clients. Tokens
 
 ## Onboarding (pairing)
 1. Generate a pairing code from the UI (FLEET tab) or `POST /api/lab/pairing` → `{pairing_id, pairing_code, expires_in, expires_at}` (shown once).
-2. Run a worker with `--pairing <pairing_code>`. The worker must call `register` with that code.
+2. Run a worker with `--pairing-stdin` and supply the code through stdin, or an owner-only 0600 pairing file. Never pass secrets in process arguments (ps/history). The worker must call `register` with that code.
 
 ## Endpoints
 | Method | Path | Auth | Description |

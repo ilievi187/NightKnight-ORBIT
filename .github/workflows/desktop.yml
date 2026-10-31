@@ -1,0 +1,125 @@
+name: ORBIT Desktop (Linux AppImage + Portable)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'agent/**'
+    tags:
+      - 'v*'
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps (Tauri/AppImage)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            curl \
+            wget \
+            file \
+            xdg-utils
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node (for optional assets)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      - name: Build server sidecar (onedir)
+        run: |
+          pyinstaller packaging/orbit-server.spec --noconfirm --distpath dist/server
+
+      - name: Build mock worker sidecar (onefile)
+        run: |
+          pyinstaller packaging/orbit-mock-worker.spec --noconfirm --distpath dist/worker
+
+      - name: Stage sidecars for Tauri externalBin
+        run: |
+          mkdir -p src-tauri/binaries
+          cp dist/server/orbit-server/orbit-server src-tauri/binaries/orbit-server-x86_64-unknown-linux-gnu
+          cp dist/worker/orbit-mock-worker src-tauri/binaries/orbit-mock-worker-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/*
+
+      - name: Install Tauri CLI
+        run: |
+          cargo install tauri-cli --version ^2 --locked || cargo install tauri-cli --version ^2
+
+      - name: Build Tauri AppImage
+        run: |
+          cd src-tauri && cargo tauri build --bundles appimage --ci || cd .. && cargo tauri build --bundles appimage --ci
+        continue-on-error: true
+
+      - name: Build portable fallback (tar.gz)
+        run: |
+          mkdir -p packaging/portable
+          rm -rf packaging/portable/orbit-desktop-portable
+          mkdir -p packaging/portable/orbit-desktop-portable/bin packaging/portable/orbit-desktop-portable/web
+          cp -r dist/server/orbit-server/* packaging/portable/orbit-desktop-portable/bin/
+          cp -r web/* packaging/portable/orbit-desktop-portable/web/
+          cp dist/worker/orbit-mock-worker packaging/portable/orbit-desktop-portable/bin/orbit-mock-worker 2>/dev/null || cp dist/worker/orbit-mock-worker packaging/portable/orbit-desktop-portable/bin/ || true
+          cat > packaging/portable/orbit-desktop-portable/orbit-desktop << 'EOF'
+          #!/usr/bin/env bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export ORBIT_WEB_DIR="$DIR/web"
+          export ORBIT_MOCK_WORKER="$DIR/bin/orbit-mock-worker"
+          export PATH="$DIR/bin:$PATH"
+          exec "$DIR/bin/orbit-server" "$@"
+          EOF
+          chmod +x packaging/portable/orbit-desktop-portable/orbit-desktop packaging/portable/orbit-desktop-portable/bin/* 2>/dev/null || true
+          cat > packaging/portable/orbit-desktop-portable/README-PORTABLE.txt << 'EOF'
+          NightKnight ORBIT - Portable (Linux)
+          ====================================
+          Run: ./orbit-desktop
+          Binds to 127.0.0.1 only. Stops with Ctrl+C.
+          Worker: bin/orbit-mock-worker (real process)
+          EOF
+          tar -C packaging/portable -czf packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz orbit-desktop-portable
+          sha256sum packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz > packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz.sha256
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          find src-tauri/target/release/bundle -name '*.AppImage' -exec cp {} artifacts/ \; 2>/dev/null || true
+          find src-tauri/target -name '*.AppImage' -exec cp {} artifacts/ \; 2>/dev/null || true
+          cp packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz artifacts/ 2>/dev/null || true
+          cp packaging/portable/NightKnight-ORBIT-portable-linux-x86_64.tar.gz.sha256 artifacts/ 2>/dev/null || true
+          (cd artifacts && sha256sum * > SHA256SUMS 2>/dev/null || true)
+          ls -la artifacts/
+
+      - name: Upload artifacts (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NightKnight-ORBIT-Desktop-Linux
+          path: artifacts/*
+          if-no-files-found: warn
+
+      - name: CI smoke (Python tests)
+        run: |
+          python -m unittest discover -s tests

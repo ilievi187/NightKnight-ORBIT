@@ -1,0 +1,26 @@
+[package]
+name = "orbit-desktop"
+version = "0.1.0"
+description = "NightKnight ORBIT Desktop"
+authors = ["NightKnight"]
+license = "MIT"
+repository = "https://github.com/ilievi187/NightKnight-ORBIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "orbit_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "orbit-desktop"
+path = "src/main.rs"
+
+ureq = "2"

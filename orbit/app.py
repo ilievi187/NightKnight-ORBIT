@@ -1,4 +1,6 @@
 """Minimal HTTP API and bundled UI. Keep it loopback-only until authentication exists."""
+import os
+import sys
 from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -10,8 +12,30 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .storage import Storage
 from .harness import Harness, PROFILES, ProviderError
+from .fleet import Fleet, FleetStore
+from .planmode import PlanStore, Supervisor
+from .mission_api import build_mission_router, create_worker_hooks, demo_root
 
 WEB_DIR = Path(__file__).parent.parent / "web"
+
+
+def _bundled_web_dir() -> Path | None:
+    """Frozen (PyInstaller) builds keep web assets under _MEIPASS; env wins."""
+    env = os.getenv("ORBIT_WEB_DIR")
+    if env and Path(env).is_dir():
+        return Path(env)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundled = Path(meipass) / "web"
+        if bundled.is_dir():
+            return bundled
+    return None
+
+
+if not WEB_DIR.is_dir():
+    _candidate = _bundled_web_dir()
+    if _candidate:
+        WEB_DIR = _candidate
 
 
 class NewSession(BaseModel):
@@ -33,6 +57,20 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     engine = Harness(settings, store, client=client)
     app = FastAPI(title="NightKnight ORBIT", version="0.1.0", docs_url="/api/docs", redoc_url=None)
     app.state.engine = engine
+    # Plan Mode kernel + worker fleet (issue #12). Additive; the loopback and
+    # TrustedHost boundary below keeps this exactly as local-facing as the core API.
+    plan_store = PlanStore(settings.database)
+    hooks = create_worker_hooks(settings.database)
+    fleet_registry = Fleet(FleetStore(settings.database), running_task_ids=hooks[0])
+    supervisor = Supervisor(plan_store, default_root=settings.workspace, fleet=fleet_registry)
+    app.state.missions = supervisor
+    app.state.fleet = fleet_registry
+    missions_enabled = os.getenv("ORBIT_MISSIONS", "1") != "0"
+    if missions_enabled:
+        app.include_router(build_mission_router(
+            supervisor, fleet_registry,
+            enable_tick=os.getenv("ORBIT_MISSION_TICK", "0") == "1",
+            task_of_worker=hooks[1]))
     # Reject DNS rebinding attempts against the loopback-only service.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="assets")

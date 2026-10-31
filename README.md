@@ -1,5 +1,7 @@
 # NightKnight ORBIT — Universal AI Agent Harness
 
+> Product direction: [ORBIT North Star](docs/ORBIT-NORTH-STAR.md) | [Supervisor epic #9](https://github.com/ilievi187/NightKnight-ORBIT/issues/9). This is a first-step prototype, not the full autonomous supervisor.
+
 **Prototype v0.2 (agent-ready)** · Local-first · OpenAI-compatible models · SQLite sessions · Explicit tool approvals · Sci-Fi mission-control UI
 
 ORBIT is the proposed independent orchestration layer for **ALEX**, **NOVA** and **HERMES**. It **does not replace or modify** the existing local `NightKnight-ALEX` installation or the private Hermes backup. The profiles in v0.1 are prompt-defined personalities, **not yet integrations** with those running services.

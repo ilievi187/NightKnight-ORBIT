@@ -3,38 +3,201 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#07080e">
-  <meta name="description" content="NightKnight ORBIT — local-first AI agent harness">
+  <meta name="theme-color" content="#05070d">
+  <meta name="description" content="NightKnight ORBIT — local-first AI agent harness and mission supervisor">
   <title>NightKnight ORBIT · Mission Control</title>
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
   <div id="app" class="shell">
+
+    <!-- ===================== LEFT CONSOLE ===================== -->
     <aside class="sidebar">
-      <div class="brand"><div class="brand-symbol">◎</div><div><strong>NIGHTKNIGHT</strong><span>ORBIT / HARNESS 0.1</span></div></div>
-      <button class="new-mission" id="newSession">+ &nbsp; НОВА МИСИЯ</button>
-      <div class="aside-label">АКТИВНИ МИСИИ</div>
-      <div id="sessions" class="session-list" aria-label="Сесии"></div>
-      <div class="aside-bottom"><div class="status-dot"></div><span>LOCAL ENGINE ONLINE</span><small id="version">v0.1.0</small></div>
+      <div class="brand">
+        <div class="brand-symbol">◎</div>
+        <div><strong>NIGHTKNIGHT</strong><span>ORBIT / MISSION CONTROL</span></div>
+      </div>
+
+      <nav class="tab-nav" aria-label="Control sections">
+        <button class="tab-btn active" data-tab="stream"  id="tabBtnStream"><span class="tab-glyph">◈</span>STREAM<small>chat · sessions</small></button>
+        <button class="tab-btn" data-tab="missions" id="tabBtnMissions"><span class="tab-glyph">🜲</span>MISSIONS<small>plan mode · tasks</small></button>
+        <button class="tab-btn" data-tab="fleet"    id="tabBtnFleet"><span class="tab-glyph">✥</span>FLEET<small>workers · pairing</small></button>
+        <button class="tab-btn" data-tab="system"   id="tabBtnSystem"><span class="tab-glyph">⌁</span>SYSTEM<small>health · runtime</small></button>
+      </nav>
+
+      <div id="streamAside" class="stream-aside">
+        <button class="new-mission" id="newSession">+ &nbsp; НОВА МИСИЯ</button>
+        <div class="aside-label">АКТИВНИ МИСИИ · STREAM</div>
+        <div id="sessions" class="session-list" aria-label="Сесии"></div>
+      </div>
+
+      <div class="aside-bottom">
+        <div class="status-dot"><span class="pulse"></span></div>
+        <span>LOCAL ENGINE ONLINE</span>
+        <small id="version">v0.1.0</small>
+      </div>
     </aside>
+
+    <!-- ===================== MAIN COLUMN ===================== -->
     <main class="main">
-      <header class="topbar">
-        <div><div class="eyebrow">MISSION CONTROL <span class="separator">/</span> <span id="activeProfile">ALEX</span></div><h1 id="missionTitle">Нова мисия</h1></div>
-        <div class="top-pill"><span class="green-circle"></span> LOCAL-FIRST <span class="top-divider">|</span><span id="modelShort">MODEL</span></div>
-      </header>
-      <section class="messages" id="messages" aria-live="polite">
-        <div class="intro"><div class="intro-mark">◎</div><div class="intro-kicker">WELCOME TO THE ORBIT</div><h2>Един контролен център.<br><em>Неограничени възможности.</em></h2><p>ALEX, NOVA и HERMES са готови за мисии. Избери агент, задай задача и контролирай всяко действие.</p></div>
+
+      <!-- ________________________ STREAM TAB ________________________ -->
+      <section id="tab-stream" class="tab-page active" aria-label="Stream">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">MISSION CONTROL <span class="separator">/</span> <span id="activeProfile">ALEX</span></div>
+            <h1 id="missionTitle">Нова мисия</h1>
+          </div>
+          <div class="top-pill"><span class="green-circle"></span> LOCAL-FIRST <span class="top-divider">|</span><span id="modelShort">MODEL</span></div>
+        </header>
+
+        <section class="messages" id="messages" aria-live="polite">
+          <div class="intro">
+            <div class="intro-mark">◎</div>
+            <div class="intro-kicker">WELCOME TO THE ORBIT</div>
+            <h2>Един контролен център.<br><em>Неограничени възможности.</em></h2>
+            <p>ALEX, NOVA и HERMES са готови за мисии. MISSIONS табът добавя автономния supervisor: цели, критерии, verification, replan.</p>
+          </div>
+        </section>
+
+        <section id="approvals" class="approvals" aria-live="assertive"></section>
+        <div id="banner" class="banner" role="status" hidden></div>
+
+        <form id="composer" class="composer">
+          <label for="message" class="sr-only">Въведи задача</label>
+          <textarea id="message" rows="2" placeholder="Задай мисия на агента..." maxlength="10000" required></textarea>
+          <div class="composer-bottom">
+            <span>TOOLS: READ AUTO · WRITE APPROVAL</span>
+            <button type="submit" id="send">ИЗПРАТИ ↗</button>
+          </div>
+        </form>
+        <div class="footnote">ORBIT DOES NOT EXECUTE SYSTEM COMMANDS · WORKER ARTIFACTS ARE VERIFIED AGAINST FILES, NOT CLAIMS</div>
       </section>
-      <section id="approvals" class="approvals" aria-live="assertive"></section>
-      <div id="banner" class="banner" role="status" hidden></div>
-      <form id="composer" class="composer">
-        <label for="message" class="sr-only">Въведи задача</label>
-        <textarea id="message" rows="2" placeholder="Задай мисия на агента..." maxlength="10000" required></textarea>
-        <div class="composer-bottom"><span>TOOLS: READ AUTO · WRITE APPROVAL</span><button type="submit" id="send">ИЗПРАТИ ↗</button></div>
-      </form>
-      <div class="footnote">ORBIT DOES NOT EXECUTE SYSTEM COMMANDS IN V0.1 · YOU APPROVE EVERY FILE CHANGE</div>
+
+      <!-- ________________________ MISSIONS TAB ________________________ -->
+      <section id="tab-missions" class="tab-page" aria-label="Missions">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">PLAN MODE <span class="separator">/</span> SUPERVISOR</div>
+            <h1>Автономни мисии</h1>
+          </div>
+          <div class="top-actions">
+            <button class="ghost-btn danger" id="launchDemoWorker">+[mock worker]</button>
+            <button class="ghost-btn primary" id="launchDemoMission">▶ LAUNCH DEMO MISSION</button>
+          </div>
+        </header>
+
+        <div id="missionBanner" class="banner" role="status" hidden></div>
+
+        <div class="pipeline-strip" id="pipelineStrip" hidden></div>
+
+        <div class="missions-scroll">
+          <section class="mission-cols">
+            <div class="mission-col">
+              <div class="aside-label">ACTIVE GRAPH · <span id="missionTaskCounts">--</span></div>
+              <div id="missionTasks" class="task-list"></div>
+            </div>
+            <div class="mission-col">
+              <div class="aside-label">MISSIONS REGISTRY</div>
+              <div id="missionList" class="mission-list"></div>
+              <details class="mission-create">
+                <summary>＋ CUSTOM MISSION (advanced)</summary>
+                <form id="customMissionForm">
+                  <label class="sr-only" for="missionGoal">Goal</label>
+                  <textarea id="missionGoal" rows="2" maxlength="300" placeholder="Цел: опиши мисията..."></textarea>
+                  <label class="sr-only" for="missionCriteria">Criteria JSON</label>
+                  <textarea id="missionCriteria" rows="5" placeholder='[{"kind":"file_contains","path":"out.md","needle":"DONE","text":"mark done"}]'></textarea>
+                  <button type="submit" id="createMissionBtn">CREATE MISSION</button>
+                  <p class="hint">Criteria kinds: file_exists · file_contains · sha256 — verifier-точни, само файлове в workspace/orbit-demo.</p>
+                </form>
+              </details>
+            </div>
+          </section>
+
+          <section class="mission-col">
+            <div class="aside-label">CRITERIA EVIDENCE <span class="muted">— файлов запис, не self-claims</span></div>
+            <div id="missionCriteria" class="criteria-list"></div>
+            <div class="aside-label">EVENT LOG</div>
+            <div id="missionEvents" class="event-log"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ________________________ FLEET TAB ________________________ -->
+      <section id="tab-fleet" class="tab-page" aria-label="Fleet">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">WORKER FLEET <span class="separator">/</span> PAIRING</div>
+            <h1>Свързани работници</h1>
+          </div>
+          <div class="top-actions">
+            <button class="ghost-btn primary" id="createPairing">＋ GENERATE PAIRING</button>
+          </div>
+        </header>
+
+        <div id="fleetBanner" class="banner" role="status" hidden></div>
+
+        <section class="pairing-panel" id="pairingPanel" hidden>
+          <div class="pairing-glyph"><tool_call></div>
+          <div>
+            <div class="eyebrow">ONE-SHOT PAIRING CODE · <span id="pairingExpiry">--</span></div>
+            <div class="pairing-code" id="pairingCode">----</div>
+            <p class="hint">Показва се веднъж. Хеширан в SQLite, единична употреба, 10 минути. Worker команда:
+              <code>orbit-mock-worker --api http://127.0.0.1:&lt;port&gt; --pairing &lt;code&gt;</code></p>
+          </div>
+        </section>
+
+        <div class="mission-col wide">
+          <div class="aside-label">REGISTERED WORKERS · <span id="workerCount">0</span> — профилите (ALEX/NOVA/HERMES) са отделни от живите workers</div>
+          <div id="workerList" class="worker-list"></div>
+        </div>
+
+        <div class="mission-col wide">
+          <div class="aside-label">PAIRINGS JOURNAL · без кодове или хешове</div>
+          <div id="pairingLog" class="pairing-log"></div>
+        </div>
+      </section>
+
+      <!-- ________________________ SYSTEM TAB ________________________ -->
+      <section id="tab-system" class="tab-page" aria-label="System">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">SYSTEM <span class="separator">/</span> DIAGNOSTICS</div>
+            <h1>Engine състояние</h1>
+          </div>
+          <div class="top-actions">
+            <button class="ghost-btn primary" id="probeRuntime">⛶ PROBE RUNTIME</button>
+            <button class="ghost-btn" id="benchRuntime">⏱ BENCHMARK</button>
+          </div>
+        </header>
+
+        <div id="systemBanner" class="banner" role="status" hidden></div>
+
+        <div class="mission-col wide">
+          <div class="aside-label">CORE HEALTH</div>
+          <div id="systemHealth" class="metric-grid"></div>
+        </div>
+
+        <div class="mission-col wide">
+          <div class="aside-label">INFERENCE RUNTIME <span class="muted">M3 (PR #7) parity — honest 404 message until merged</span></div>
+          <div id="runtimePanel" class="runtime-panel"></div>
+        </div>
+
+        <div class="mission-col wide">
+          <div class="aside-label">WORKER API <span class="muted">versioned loopback contract</span></div>
+          <div class="api-card">
+            <code>POST /api/workers/v0.1/register</code><span>pairing-held registration → 256-bit token (once)</span>
+            <code>POST /api/workers/v0.1/heartbeat</code><span>presence + assignment poll</span>
+            <code>POST /api/workers/v0.1/claim</code><span>ASSIGNED → RUNNING, scoped by grant</span>
+            <code>POST /api/workers/v0.1/report</code><span>evidence metadata only — files are verified server-side</span>
+            <code>POST /api/workers/v0.1/unregister</code><span>revoke this worker</span>
+          </div>
+        </div>
+      </section>
     </main>
+
+    <!-- ===================== RIGHT CONSTELLATION ===================== -->
     <aside class="right-panel">
       <div class="right-heading"><span class="eyebrow">AGENT CONSTELLATION</span><span class="live-indicator">● LIVE</span></div>
       <div class="universe" aria-label="Избор на агент">
@@ -45,7 +208,16 @@
         <button class="planet nova" data-profile="NOVA"><span>✦</span><small>NOVA</small></button>
         <button class="planet hermes" data-profile="HERMES"><span>◇</span><small>HERMES</small></button>
       </div>
-      <div class="agent-details"><span class="muted">ACTIVE PROFILE</span><h3 id="profileName">ALEX <span>●</span></h3><p id="profileDescription">Engineering & development</p></div>
+      <div class="agent-details">
+        <span class="muted">ACTIVE PROFILE</span>
+        <h3 id="profileName">ALEX <span>●</span></h3>
+        <p id="profileDescription">Engineering & development</p>
+      </div>
+      <div class="section-line"></div>
+      <div class="right-heading"><span class="eyebrow">FLEET SUMMARY</span></div>
+      <div class="metric"><span>WORKERS LIVE</span><strong id="fleetLive" class="green">0</strong></div>
+      <div class="metric"><span>WORKERS TOTAL</span><strong id="fleetTotal" class="green">0</strong></div>
+      <div class="metric"><span>MISSIONS ACTIVE</span><strong id="missionsActive" class="violet">0</strong></div>
       <div class="section-line"></div>
       <div class="right-heading"><span class="eyebrow">SYSTEM TELEMETRY</span><span class="muted">v0.1</span></div>
       <div class="metric"><span>MODEL</span><strong id="model">--</strong></div>

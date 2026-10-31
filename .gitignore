@@ -5,3 +5,6 @@ __pycache__/
 .env
 .pytest_cache/
 .DS_Store
+
+# Installed COSMOS binaries are local user assets (21 MB total).
+web/cosmos/*.png

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .storage import Storage
 from .harness import Harness, PROFILES, ProviderError
+from .runtime import build_runtime, ProviderChatError
 from .fleet import Fleet, FleetStore
 from .planmode import PlanStore, Supervisor
 from .mission_api import build_mission_router, create_worker_hooks, demo_root
@@ -51,12 +52,25 @@ class ApprovalDecision(BaseModel):
     approve: bool
 
 
+class ProbeRequest(BaseModel):
+    providers: list[str] | None = None
+
+
+class BenchmarkRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    prompt: str = Field(default="Reply with a single short word.", max_length=400)
+    max_tokens: int = Field(default=32, ge=1, le=512)
+
+
 def create_app(settings: Settings | None = None, client: httpx.Client | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
     store = Storage(settings.database)
     engine = Harness(settings, store, client=client)
+    runtime = build_runtime(settings, client=client)
     app = FastAPI(title="NightKnight ORBIT", version="0.1.0", docs_url="/api/docs", redoc_url=None)
     app.state.engine = engine
+    app.state.runtime = runtime
     # Plan Mode kernel + worker fleet (issue #12). Additive; the loopback and
     # TrustedHost boundary below keeps this exactly as local-facing as the core API.
     plan_store = PlanStore(settings.database)
@@ -98,12 +112,50 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "version": "0.1.0", "provider_status": "not_checked", "model": settings.model,
-                "base_url": settings.base_url, "workspace": str(settings.workspace), "write_policy": "human_approval"}
+        diag = runtime.status()  # cached snapshot only, no network activity
+        return {"status": "ok", "version": "0.1.0", "provider_status": diag.get("selected_status") or "not_checked",
+                "model": settings.model, "base_url": settings.base_url, "workspace": str(settings.workspace),
+                "write_policy": "human_approval", "runtime": {
+                    "probed_provider": diag.get("selected"),
+                    "probed_model": diag.get("selected_model"),
+                    "probe_status": diag.get("selected_status"),
+                    "probe_latency_ms": diag.get("selected_latency_ms"),
+                    # Backward-compatible keys for M3 clients. All remain probe-only,
+                    # never imply the Harness chat route has switched providers.
+                    "selected_provider": diag.get("selected"),
+                    "selected_status": diag.get("selected_status"),
+                    "selected_latency_ms": diag.get("selected_latency_ms"),
+                    "provider_count": diag.get("provider_count"),
+                    "note": "Probe metadata only; ORBIT chat still uses configured Harness provider.",
+                }}
 
     @app.get("/api/agents")
     def agents():
         return [{"id": key, "description": val} for key, val in PROFILES.items()]
+
+    @app.get("/api/runtime")
+    def runtime_status():
+        """Cached model endpoint metadata; not the selected active chat transport."""
+        return runtime.status()
+
+    @app.post("/api/runtime/probe")
+    def runtime_probe(payload: ProbeRequest):
+        """Explicit read-only probe. READY means model-list reachable, not weights loaded."""
+        try:
+            return runtime.probe(payload.providers)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/runtime/benchmark")
+    def runtime_benchmark(payload: BenchmarkRequest):
+        """One explicitly requested completion; usage-derived tokens/s when available."""
+        try:
+            return runtime.benchmark(payload.provider, payload.model,
+                                     prompt=payload.prompt, max_tokens=payload.max_tokens)
+        except ProviderChatError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/api/sessions")
     def sessions():

@@ -22,4 +22,4 @@ jobs:
       - name: Unit and security regression tests
         run: python -m unittest discover -s tests -v
       - name: Bytecode syntax check
-        run: python -m compileall -q orbit tests
+        run: python -m compileall -q orbit tools tests

@@ -648,7 +648,7 @@ function renderBrainCatalog(catalog) {
     }
     const options = element('div','setup-model-options');
     const listed = q && !matches.length ? [] : matches;
-    for (const model of listed) {
+    const buildModelButton = model => {
       const select = element('button','setup-model-option');
       select.type = 'button';
       select.append(element('strong','',model.model),element('span','','ИЗБЕРИ МОЗЪК'));
@@ -661,9 +661,20 @@ function renderBrainCatalog(catalog) {
         } catch(e){showSetupError(e.message);}
         finally{select.disabled=false;}
       });
-      options.append(select);
-    }
+      return select;
+    };
+    for (const model of (q ? listed : listed.slice(0,24)))
+      options.append(buildModelButton(model));
     block.append(options);
+    if (!q && listed.length > 24) {
+      const more = element('button','ghost-btn','ПОКАЖИ ОЩЕ '+(listed.length-24)+' МОДЕЛА');
+      more.type='button';
+      more.addEventListener('click',()=>{
+        for (const model of listed.slice(24)) options.append(buildModelButton(model));
+        more.remove();
+      });
+      block.append(more);
+    }
     if (source.origin === 'User-configured') {
       const remove = element('button','setup-remove-provider','ПРЕМАХНИ PROVIDER');
       remove.type='button';remove.addEventListener('click',()=>deleteProvider(source));

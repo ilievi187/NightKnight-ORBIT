@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .provider_sources import ProviderSources, ProviderSetupError
+
 
 class SetupError(ValueError):
     pass
@@ -26,7 +28,8 @@ class BrainControl:
     def __init__(self, settings, fleet, client: httpx.Client | None = None):
         self.settings = settings
         self.fleet = fleet
-        self.client = client or httpx.Client(timeout=httpx.Timeout(0.7, connect=0.4), trust_env=False)
+        self.client = client or httpx.Client(timeout=httpx.Timeout(0.8, connect=0.4), trust_env=False)
+        self.providers = ProviderSources(settings, client=self.client)
         self.filename = Path(settings.database)
         with self.connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS orbit_setup (
@@ -69,68 +72,47 @@ class BrainControl:
     def _key(base_url: str, model: str) -> str:
         return hashlib.sha256((base_url + "\0" + model).encode()).hexdigest()[:24]
 
-    def _configured_urls(self):
-        out = [(self.settings.base_url.rstrip("/"), self.settings.model, "Configured")]
-        for cfg in getattr(self.settings, "providers", ()) or ():
-            u = str(cfg.get("base_url") or "").rstrip("/")
-            if u:
-                out.append((u, cfg.get("model"), str(cfg.get("name") or "Configured")))
-        # Explicitly scoped local discovery; no subnet scan, no arbitrary URL supplied by browser.
-        out.extend([
-            ("http://127.0.0.1:18879/v1", None, "Local llama.cpp"),
-            ("http://127.0.0.1:8080/v1", None, "Local OpenAI API"),
-            ("http://127.0.0.1:11434/v1", None, "Local Ollama"),
-        ])
-        dedup = {}
-        for u, model, origin in out:
-            parsed = urlsplit(u)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                continue
-            # No credentials in URL are accepted in the catalog.
-            if parsed.username or parsed.password:
-                continue
-            dedup.setdefault(u, (u, model, origin))
-        return list(dedup.values())[:12]
-
     def _api_key_for(self, url: str) -> str:
-        if url == self.settings.base_url:
-            return self.settings.api_key
-        for cfg in getattr(self.settings, "providers", ()) or ():
-            if str(cfg.get("base_url") or "").rstrip("/") == url:
-                return str(cfg.get("api_key") or "")
-        return ""
+        return self.providers.api_key_for(url)
 
     def catalog(self) -> dict:
+        sources = self.providers.catalog()
         choices = []
-        for url, configured_model, origin in self._configured_urls():
-            models = []
-            error = None
-            headers = {}
-            api_key = self._api_key_for(url)
-            if api_key:
-                headers["Authorization"] = "Bearer " + api_key
-            try:
-                # All requests are to explicit server configuration or fixed loopback seeds.
-                response = self.client.get(url + "/models", headers=headers, timeout=0.7)
-                response.raise_for_status()
-                payload = response.json()
-                entries = payload.get("data") or payload.get("models") or []
-                if not isinstance(entries, list):
-                    raise ValueError("Model list is not an array")
-                models = [str(x.get("id") or x.get("name"))
-                          for x in entries[:64] if isinstance(x, dict)
-                          and (x.get("id") or x.get("name"))]
-            except (httpx.HTTPError, ValueError, TypeError) as exc:
-                error = str(exc)[:120]
-            for model in dict.fromkeys(models):
-                choices.append({"id": self._key(url, model), "model": model,
-                                "base_url": url, "origin": origin, "online": True})
-            if configured_model and configured_model not in models:
-                choices.append({"id": self._key(url, str(configured_model)),
-                                "model": str(configured_model), "base_url": url,
-                                "origin": origin, "online": False,
-                                "note": "Не е потвърден в model API" if not error else "API offline"})
-        return {"brains": choices, "selection": self.status()}
+        for source in sources:
+            for model in source["models"]:
+                choices.append({
+                    "id": self._key(source["base_url"], model),
+                    "model": model, "base_url": source["base_url"],
+                    "source_id": source["id"], "origin": source["name"],
+                    "category": source["category"], "online": True,
+                    # A models-list response does not prove weights are loaded.
+                    "note": "Моделът е в API каталога; генерирането още не е проверено",
+                })
+            configured = source.get("model_hint")
+            if configured and configured not in source["models"]:
+                choices.append({
+                    "id": self._key(source["base_url"], configured),
+                    "model": configured, "base_url": source["base_url"],
+                    "source_id": source["id"], "origin": source["name"],
+                    "category": source["category"], "online": False,
+                    "note": "Моделът не е потвърден в API каталога",
+                })
+        return {"brains": choices, "sources": sources, "selection": self.status(),
+                "disclaimer": "Plus/Pro subscription accounts do not automatically grant API access."}
+
+    def add_provider(self, name: str, url: str, key: str = "", model: str | None = None) -> dict:
+        return self.providers.register(name, url, key, model)
+
+    def remove_provider(self, identifier: str) -> None:
+        matches = [x for x in self.providers.sources() if x["id"] == identifier]
+        if not matches:
+            raise ProviderSetupError("Provider не е намерен")
+        self.providers.remove(identifier)
+        selected = self.status()["brain"]
+        if selected and selected["base_url"] == matches[0]["base_url"]:
+            with self.connect() as db:
+                db.execute("""UPDATE orbit_setup SET base_url=NULL,model=NULL,
+                           selected_workers='[]',confirmed=0 WHERE slot=1""")
 
     def select(self, brain_id: str) -> dict:
         choices = self.catalog()["brains"]

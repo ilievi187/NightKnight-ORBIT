@@ -87,14 +87,23 @@ class BrainControl:
             dedup.setdefault(u, (u, model, origin))
         return list(dedup.values())[:12]
 
+    def _api_key_for(self, url: str) -> str:
+        if url == self.settings.base_url:
+            return self.settings.api_key
+        for cfg in getattr(self.settings, "providers", ()) or ():
+            if str(cfg.get("base_url") or "").rstrip("/") == url:
+                return str(cfg.get("api_key") or "")
+        return ""
+
     def catalog(self) -> dict:
         choices = []
         for url, configured_model, origin in self._configured_urls():
             models = []
             error = None
             headers = {}
-            if url == self.settings.base_url and self.settings.api_key:
-                headers["Authorization"] = "Bearer " + self.settings.api_key
+            api_key = self._api_key_for(url)
+            if api_key:
+                headers["Authorization"] = "Bearer " + api_key
             try:
                 # All requests are to explicit server configuration or fixed loopback seeds.
                 response = self.client.get(url + "/models", headers=headers, timeout=0.7)
@@ -135,8 +144,7 @@ class BrainControl:
             # Preserves the existing API contract for old integrations, while the
             # user-facing setup screen does not allow chats before choosing a brain.
             return self.settings.base_url, self.settings.model, self.settings.api_key
-        key = self.settings.api_key if chosen["base_url"] == self.settings.base_url else ""
-        return chosen["base_url"], chosen["model"], key
+        return chosen["base_url"], chosen["model"], self._api_key_for(chosen["base_url"])
 
     def workers(self) -> dict:
         now = time.time()

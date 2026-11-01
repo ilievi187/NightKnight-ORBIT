@@ -2,9 +2,11 @@
 /* ORBIT console: STREAM (v0.2 parity) + MISSIONS (plan mode) + FLEET + SYSTEM
    (M3 runtime parity, honest 404 until PR #7 merges). CSP-safe: no eval, no CDN. */
 const $ = id => document.getElementById(id);
-const descriptions = {ALEX:'Engineering · code · systems', NOVA:'Architecture · planning · research', HERMES:'Local models · efficient execution'};
+const descriptions = {ORBIT:'Selected brain and user-approved real workers'};
+let setupState = null;
+let setupStage = 'brain';
 let activeSession = null;
-let activeProfile = 'ALEX';
+let activeProfile = 'ORBIT';
 let busy = false;
 let requiresApproval = false;
 let activeTab = 'stream';
@@ -63,9 +65,9 @@ function selectTab(name) {
 function chooseProfile(profile) {
   activeProfile = profile;
   $('activeProfile').textContent = profile;
-  $('profileName').textContent = profile + ' ●';
-  $('profileDescription').textContent = descriptions[profile];
-  document.querySelectorAll('.planet').forEach(p => p.classList.toggle('active', p.dataset.profile === profile));
+  // A conversational profile is never a real worker, and no planet is faked.
+  if (!setupState?.brain) $('profileName').textContent = 'НЕ Е ИЗБРАН';
+  $('profileDescription').textContent = String(setupState?.worker_ids?.length || 0) + ' разрешени агенти';
 }
 async function loadSessions() {
   const sessions = await api('/api/sessions');
@@ -79,6 +81,7 @@ async function loadSessions() {
 }
 async function createSession(profile = activeProfile) {
   if (busy) return;
+  if (!setupState?.targets_confirmed) { await openSetup(); return; }
   chooseProfile(profile);
   const session = await api('/api/sessions', {method:'POST',body:JSON.stringify({profile, title:'Нова мисия · '+profile})});
   return loadSession(session.id);
@@ -104,7 +107,7 @@ function render(detail) {
     h2.append(document.createTextNode('Един контролен център.'));
     h2.append(document.createElement('br'));
     h2.append(element('em','','Неограничени възможности.'));
-    wrap.append(h2, element('p','','ALEX, NOVA и HERMES са готови. MISSIONS табът води автономния supervisor.'));
+    wrap.append(h2, element('p','','Моделът мисли. Само регистрирани и изрично разрешени workers могат да получават задачи.'));
     target.append(wrap);
   }
   for (const msg of detail.messages || []) {
@@ -163,6 +166,7 @@ async function sendMessage(event) {
   event.preventDefault();
   const content = $('message').value.trim();
   if (!content || busy || requiresApproval) return;
+  if (!setupState?.targets_confirmed) { await openSetup(); return; }
   setBusy(true); banner('');
   try {
     if (!activeSession) {
@@ -432,8 +436,8 @@ function renderHealth(health) {
     metric.append(element('span','', label), element('strong', tone, String(value)));
     target.append(metric);
   }
-  $('modelShort').textContent = health.model || 'MODEL';
-  $('model').textContent = health.model || '--';
+  $('modelShort').textContent = setupState?.brain?.model || 'ИЗБЕРИ МОЗЪК';
+  $('model').textContent = setupState?.brain?.model || '--';
   $('workspace').textContent = health.workspace || '--';
 }
 function runtimePanel(data) {
@@ -525,6 +529,119 @@ function startClock() {
   }, 2000);
 }
 
+
+/* === FIRST RUN: select actual model brain, then an explicit worker allowlist === */
+function showSetupError(message) {
+  $('setupError').hidden = !message;
+  $('setupError').textContent = message || '';
+}
+async function openSetup(preferred = null) {
+  $('setupScreen').hidden = false;
+  setupState = await api('/api/setup/status');
+  renderSelectedBrain();
+  if (preferred === 'brain' || !setupState.brain) return showBrainStep();
+  if (preferred === 'workers' || !setupState.targets_confirmed) return showWorkerStep();
+  $('setupScreen').hidden = true;
+}
+function renderSelectedBrain() {
+  const brain = setupState?.brain;
+  $('profileName').textContent = brain?.model || 'НЕ Е ИЗБРАН';
+  $('profileDescription').textContent = String(setupState?.worker_ids?.length || 0) + ' разрешени агенти';
+  $('modelShort').textContent = brain?.model || 'ИЗБЕРИ МОЗЪК';
+  $('model').textContent = brain?.model || '--';
+  $('provider').textContent = brain?.base_url || 'Няма избран мозък';
+  const planets = $('selectedWorkerOrbits');
+  planets.replaceChildren();
+  for (const id of setupState?.worker_ids || []) {
+    const dot = element('span', 'selected-dot');
+    dot.title = id;
+    planets.append(dot);
+  }
+}
+async function showBrainStep() {
+  setupStage = 'brain';
+  $('setupHeading').textContent = '01 / Избери мозък';
+  $('setupSubtitle').textContent = 'Избери модел, който ще мисли и планира. Показваме действително отговарящи model API-та, без да зареждаме GPU автоматично.';
+  $('setupStageOne').classList.add('current');
+  $('setupStageTwo').classList.remove('current');
+  $('setupBrainList').hidden = false;
+  $('setupTargetList').hidden = true;
+  $('setupContinue').hidden = true;
+  $('setupBack').hidden = true;
+  showSetupError('');
+  const target = $('setupBrainList');
+  target.replaceChildren(element('p', 'setup-empty', 'Откривам локалните model API-та…'));
+  try {
+    const result = await api('/api/setup/brains');
+    target.replaceChildren();
+    if (!result.brains?.length) target.append(element('p','setup-empty',
+      'Няма намерен модел. Стартирай model API и натисни ОБНОВИ.'));
+    for (const brain of result.brains || []) {
+      const btn = element('button', 'setup-option');
+      btn.type = 'button';
+      btn.disabled = !brain.online;
+      btn.append(element('strong','',brain.model),element('code','',brain.base_url),
+                 element('small','',brain.online ? 'API ONLINE · ИЗБЕРИ' : 'OFFLINE / НЕПОТВЪРДЕН'));
+      if (brain.online) btn.addEventListener('click', async () => {
+        try {
+          setupState = await api('/api/setup/brain',
+            {method:'POST',body:JSON.stringify({id:brain.id})});
+          renderSelectedBrain();
+          await showWorkerStep();
+        } catch (e) { showSetupError(e.message); }
+      });
+      target.append(btn);
+    }
+  } catch (e) { showSetupError('Грешка при проверка на моделите: ' + e.message); }
+}
+async function showWorkerStep() {
+  if (!setupState?.brain) return showBrainStep();
+  setupStage = 'workers';
+  $('setupHeading').textContent = '02 / Кого да командва?';
+  $('setupSubtitle').textContent = 'Избери само реално свързаните агенти. Ако няма нито един, продължи с мозъка; можеш да ги свържеш по-късно през FLEET.';
+  $('setupStageOne').classList.remove('current');
+  $('setupStageTwo').classList.add('current');
+  $('setupBrainList').hidden = true;
+  $('setupTargetList').hidden = false;
+  $('setupContinue').hidden = false;
+  $('setupBack').hidden = false;
+  showSetupError('');
+  const target = $('setupTargetList');
+  target.replaceChildren(element('p','setup-empty','Проверявам реалните worker регистрации…'));
+  try {
+    const result = await api('/api/setup/workers');
+    target.replaceChildren();
+    if (!result.workers?.length) target.append(element('p','setup-empty',
+      '0 СВЪРЗАНИ АГЕНТА · ORBIT започва празен. Нито ALEX, нито NOVA, нито HERMES са фиктивно регистрирани.'));
+    for (const worker of result.workers || []) {
+      const row = element('label','setup-option setup-worker');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'setup-worker-checkbox';
+      checkbox.value = worker.id;
+      checkbox.checked = setupState.worker_ids?.includes(worker.id) || false;
+      const desc = element('span','');
+      desc.append(element('strong','',worker.name+' · '+worker.host));
+      desc.append(element('small','',worker.kind+' · '+worker.status+' · '+(worker.capabilities||[]).join(', ')));
+      row.append(checkbox,desc);
+      target.append(row);
+    }
+    $('setupContinue').textContent = result.workers?.length ?
+      'ЗАПАЗИ РАЗРЕШЕНИТЕ АГЕНТИ' : 'ПРОДЪЛЖИ БЕЗ АГЕНТИ';
+  } catch (e) { showSetupError('Грешка при проверка на агентите: ' + e.message); }
+}
+async function saveTargetSelection() {
+  try {
+    const ids = [...document.querySelectorAll('.setup-worker-checkbox:checked')].map(x=>x.value);
+    setupState = await api('/api/setup/workers',
+      {method:'POST',body:JSON.stringify({worker_ids:ids})});
+    renderSelectedBrain();
+    $('setupScreen').hidden = true;
+    await refreshSummary().catch(()=>{});
+    await refreshSystem().catch(()=>{});
+  } catch (e) { showSetupError(e.message); }
+}
+
 /* ================= BOOT ================= */
 async function boot() {
   try {
@@ -539,8 +656,12 @@ async function boot() {
   // STREAM (v0.2 wiring preserved)
   $('composer').addEventListener('submit', sendMessage);
   $('newSession').addEventListener('click', () => createSession().catch(err => banner(err.message)));
-  document.querySelectorAll('.planet').forEach(p =>
-    p.addEventListener('click', () => chooseProfile(p.dataset.profile)));
+  // Brain and workers are selected explicitly, not via hardcoded agent planets.
+  $('changeBrain').addEventListener('click', () => openSetup('brain').catch(e => showSetupError(e.message)));
+  $('changeTargets').addEventListener('click', () => openSetup('workers').catch(e => showSetupError(e.message)));
+  $('setupRefresh').addEventListener('click', () => (setupStage === 'brain' ? showBrainStep() : showWorkerStep()));
+  $('setupBack').addEventListener('click', showBrainStep);
+  $('setupContinue').addEventListener('click', saveTargetSelection);
 
   // MISSIONS
   $('launchDemoMission').addEventListener('click', () => launchDemoMission().catch(err => banner(err.message, 'missionBanner')));
@@ -554,14 +675,11 @@ async function boot() {
   $('probeRuntime').addEventListener('click', () => probeRuntime().catch(err => banner(err.message, 'systemBanner')));
   $('benchRuntime').addEventListener('click', () => benchRuntime().catch(err => banner(err.message, 'systemBanner')));
 
-  // restored session (localStorage)
-  const restored = window.localStorage.getItem('orbit_session');
-  try {
-    if (restored && (await api('/api/sessions')).some(s => s.id === restored)) await loadSession(restored);
-    else await loadSessions();
-  } catch (e) { banner('Backend не отговаря: ' + e.message); }
-
+  // Show a neutral empty screen instead of auto-activating an old ALEX/NOVA profile.
+  try { await loadSessions(); }
+  catch (e) { banner('Backend не отговаря: ' + e.message); }
   await refreshSummary().catch(() => {});
+  await openSetup().catch(e => showSetupError(e.message));
   startClock();
 }
 window.addEventListener('DOMContentLoaded', boot);

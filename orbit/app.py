@@ -97,7 +97,7 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
         if not selected:
             return settings
         return replace(settings, base_url=selected["base_url"], model=selected["model"],
-                       api_key=settings.api_key if selected["base_url"] == settings.base_url else "",
+                       api_key=brains._api_key_for(selected["base_url"]),
                        providers=())
 
     runtime = build_runtime(brain_runtime_config(), client=client)

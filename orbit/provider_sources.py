@@ -168,6 +168,10 @@ class ProviderSources:
                 url, category = checked_url(raw["base_url"])
             except ProviderSetupError:
                 continue
+            # Discovery defaults and blank cloud templates must never hide a
+            # configured model hint or configured cloud API credential.
+            if url in values and raw.get("origin") in ("Discovery", "Cloud template"):
+                continue
             values[url] = dict(raw, base_url=url, category=category, id=source_id(url))
         return list(values.values())
 

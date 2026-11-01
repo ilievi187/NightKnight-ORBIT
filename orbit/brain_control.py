@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -38,10 +39,14 @@ class BrainControl:
             )""")
             db.execute("INSERT OR IGNORE INTO orbit_setup(slot) VALUES(1)")
 
+    @contextmanager
     def connect(self):
-        # sqlite3.Connection is a context manager with commit/rollback;
-        # each call uses a short-lived independent connection.
-        return sqlite3.connect(str(self.filename), timeout=20)
+        db = sqlite3.connect(str(self.filename), timeout=20)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def status(self) -> dict:
         with self.connect() as db:

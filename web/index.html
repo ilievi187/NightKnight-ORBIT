@@ -10,6 +10,23 @@
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
+  <section id="setupScreen" class="setup-screen" aria-label="Първоначална настройка">
+    <div class="setup-card">
+      <header class="setup-brand"><span class="setup-mark">◎</span> NIGHTKNIGHT / ORBIT <small>FIRST RUN</small></header>
+      <div class="setup-steps"><span id="setupStageOne">01 · МОЗЪК</span><span>━━</span><span id="setupStageTwo">02 · АГЕНТИ</span><span>━━</span><span>03 · MISSION CONTROL</span></div>
+      <h1 id="setupHeading">Избери мозъка на ORBIT</h1>
+      <p id="setupSubtitle">Първо избираш модела, който мисли. След това избираш кого командва. Нищо не се стартира в GPU автоматично.</p>
+      <div id="setupBrainList" class="setup-options"><p class="setup-empty">Откриване на model API-та…</p></div>
+      <div id="setupTargetList" class="setup-options" hidden></div>
+      <div class="setup-actions">
+        <button id="setupRefresh" type="button" class="ghost-btn">↻ ОБНОВИ</button>
+        <button id="setupBack" type="button" class="ghost-btn" hidden>← НАЗАД</button>
+        <button id="setupContinue" type="button" class="setup-primary" hidden>ПРОДЪЛЖИ БЕЗ АГЕНТИ</button>
+      </div>
+      <p id="setupError" role="alert" hidden></p>
+      <p class="setup-fineprint">Без предварително добавени агенти и фалшиви LIVE статуси. Командването изисква реална worker регистрация и разрешение.</p>
+    </div>
+  </section>
   <div id="app" class="shell">
 
     <!-- ===================== LEFT CONSOLE ===================== -->
@@ -46,10 +63,10 @@
       <section id="tab-stream" class="tab-page active" aria-label="Stream">
         <header class="topbar">
           <div>
-            <div class="eyebrow">MISSION CONTROL <span class="separator">/</span> <span id="activeProfile">ALEX</span></div>
+            <div class="eyebrow">MISSION CONTROL <span class="separator">/</span> <span id="activeProfile">ORBIT</span></div>
             <h1 id="missionTitle">Нова мисия</h1>
           </div>
-          <div class="top-pill"><span class="green-circle"></span> LOCAL-FIRST <span class="top-divider">|</span><span id="modelShort">MODEL</span></div>
+          <div class="top-pill"><span class="green-circle"></span> LOCAL-FIRST <span class="top-divider">|</span><span id="modelShort">ИЗБЕРИ МОЗЪК</span></div>
         </header>
 
         <section class="messages" id="messages" aria-live="polite">
@@ -57,7 +74,7 @@
             <div class="intro-mark">◎</div>
             <div class="intro-kicker">WELCOME TO THE ORBIT</div>
             <h2>Един контролен център.<br><em>Неограничени възможности.</em></h2>
-            <p>ALEX, NOVA и HERMES са готови за мисии. MISSIONS табът добавя автономния supervisor: цели, критерии, verification, replan.</p>
+            <p>Първо избери мозък, после реалните работници, които да командва. Няма предварително добавени агенти.</p>
           </div>
         </section>
 
@@ -139,12 +156,12 @@
         <div id="fleetBanner" class="banner" role="status" hidden></div>
 
         <section class="pairing-panel" id="pairingPanel" hidden>
-          <div class="pairing-glyph"><tool_call></div>
+          <div class="pairing-glyph">◎</div>
           <div>
             <div class="eyebrow">ONE-SHOT PAIRING CODE · <span id="pairingExpiry">--</span></div>
             <div class="pairing-code" id="pairingCode">----</div>
             <p class="hint">Показва се веднъж. Хеширан в SQLite, единична употреба, 10 минути. Worker команда:
-              <code>orbit-mock-worker --api http://127.0.0.1:&lt;port&gt; --pairing &lt;code&gt;</code></p>
+              <code>orbit-mock-worker --api http://127.0.0.1:&lt;port&gt; --pairing-stdin</code></p>
           </div>
         </section>
 
@@ -199,22 +216,21 @@
 
     <!-- ===================== RIGHT CONSTELLATION ===================== -->
     <aside class="right-panel">
-      <div class="right-heading"><span class="eyebrow">AGENT CONSTELLATION</span><span class="live-indicator">● LIVE</span></div>
-      <div class="universe" aria-label="Избор на агент">
+      <div class="right-heading"><span class="eyebrow">BRAIN & COMMAND</span><span class="muted">SETUP</span></div>
+      <div class="universe universe-empty" aria-label="Мрежа от реални агенти">
         <div class="orbit-ring ring-1"></div><div class="orbit-ring ring-2"></div>
-        <div class="star s1"></div><div class="star s2"></div><div class="star s3"></div><div class="star s4"></div><div class="star s5"></div><div class="star s6"></div>
         <div class="core"><div class="core-inner">◎</div><span>ORBIT</span></div>
-        <button class="planet alex active" data-profile="ALEX"><span>⌘</span><small>ALEX</small></button>
-        <button class="planet nova" data-profile="NOVA"><span>✦</span><small>NOVA</small></button>
-        <button class="planet hermes" data-profile="HERMES"><span>◇</span><small>HERMES</small></button>
+        <div id="selectedWorkerOrbits"></div>
       </div>
       <div class="agent-details">
-        <span class="muted">ACTIVE PROFILE</span>
-        <h3 id="profileName">ALEX <span>●</span></h3>
-        <p id="profileDescription">Engineering & development</p>
+        <span class="muted">SELECTED BRAIN</span>
+        <h3 id="profileName">НЕ Е ИЗБРАН</h3>
+        <p id="profileDescription">0 разрешени агенти</p>
+        <button id="changeBrain" class="ghost-btn" type="button">СМЕНИ МОЗЪКА</button>
+        <button id="changeTargets" class="ghost-btn" type="button">ИЗБЕРИ АГЕНТИ</button>
       </div>
       <div class="section-line"></div>
-      <div class="right-heading"><span class="eyebrow">FLEET SUMMARY</span></div>
+      <div class="right-heading"><span class="eyebrow">REAL WORKER FLEET</span></div>
       <div class="metric"><span>WORKERS LIVE</span><strong id="fleetLive" class="green">0</strong></div>
       <div class="metric"><span>WORKERS TOTAL</span><strong id="fleetTotal" class="green">0</strong></div>
       <div class="metric"><span>MISSIONS ACTIVE</span><strong id="missionsActive" class="violet">0</strong></div>

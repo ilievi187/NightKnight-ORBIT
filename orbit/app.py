@@ -1,6 +1,7 @@
 """Minimal HTTP API and bundled UI. Keep it loopback-only until authentication exists."""
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -76,10 +77,8 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     settings = settings or Settings.from_environment()
     store = Storage(settings.database)
     engine = Harness(settings, store, client=client)
-    runtime = build_runtime(settings, client=client)
     app = FastAPI(title="NightKnight ORBIT", version="0.1.0", docs_url="/api/docs", redoc_url=None)
     app.state.engine = engine
-    app.state.runtime = runtime
     # Plan Mode kernel + worker fleet (issue #12). Additive; the loopback and
     # TrustedHost boundary below keeps this exactly as local-facing as the core API.
     plan_store = PlanStore(settings.database)
@@ -92,6 +91,17 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     engine.brain_route = brains.chat_route
     supervisor.command_targets = brains
     app.state.brains = brains
+
+    def brain_runtime_config():
+        selected = brains.status()["brain"]
+        if not selected:
+            return settings
+        return replace(settings, base_url=selected["base_url"], model=selected["model"],
+                       api_key=settings.api_key if selected["base_url"] == settings.base_url else "",
+                       providers=())
+
+    runtime = build_runtime(brain_runtime_config(), client=client)
+    app.state.runtime = runtime
     missions_enabled = os.getenv("ORBIT_MISSIONS", "1") != "0"
     if missions_enabled:
         app.include_router(build_mission_router(
@@ -127,8 +137,9 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     def health():
         diag = runtime.status()  # cached snapshot only, no network activity
         setup = brains.status()
+        active = setup["brain"] or {"base_url": settings.base_url, "model": settings.model}
         return {"status": "ok", "version": "0.1.0", "setup": setup, "provider_status": diag.get("selected_status") or "not_checked",
-                "model": settings.model, "base_url": settings.base_url, "workspace": str(settings.workspace),
+                "model": active["model"], "base_url": active["base_url"], "workspace": str(settings.workspace),
                 "write_policy": "human_approval", "runtime": {
                     "probed_provider": diag.get("selected"),
                     "probed_model": diag.get("selected_model"),
@@ -153,10 +164,16 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
 
     @app.post("/api/setup/brain")
     def set_brain(payload: BrainChoice):
+        nonlocal runtime
         try:
-            return brains.select(payload.id)
+            selection = brains.select(payload.id)
         except SetupError as exc:
             raise HTTPException(409, str(exc)) from exc
+        # The probe/benchmark panel must follow the actual chosen chat route,
+        # not the stale ORBIT_BASE_URL default.
+        runtime = build_runtime(brain_runtime_config(), client=client)
+        app.state.runtime = runtime
+        return selection
 
     @app.get("/api/setup/workers")
     def list_worker_targets():

@@ -1,13 +1,15 @@
 # A real Tauri sidecar must carry the Python runtime AND its data in one executable.
 # The original onedir spec remains for the portable .tar.gz fallback.
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent
 datas = []
 if (ROOT / "web").is_dir():
     datas.append((str(ROOT / "web"), "web"))
 
-hiddenimports = [
+hiddenimports = collect_submodules('backports') + [
+    'backports', 'backports.tarfile',
     "orbit.app", "orbit.config", "orbit.harness", "orbit.storage",
     "orbit.fleet", "orbit.planmode", "orbit.mission_api",
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",

@@ -50,7 +50,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller==6.11.1
+          pip install pyinstaller==6.11.1 'backports.tarfile>=1.2.0'
 
       - name: Build server sidecar (onedir)
         run: |

@@ -5,6 +5,7 @@
 import os
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 SPEC_DIR = Path(SPECPATH)
@@ -19,7 +20,8 @@ docs_dir = ROOT / 'docs'
 if docs_dir.is_dir():
     datas.append((str(docs_dir), 'docs'))
 
-hiddenimports = [
+hiddenimports = collect_submodules('backports') + [
+    'backports', 'backports.tarfile',
     'orbit',
     'orbit.app',
     'orbit.config',

@@ -40,10 +40,18 @@ def main() -> int:
         return 3
 
     import uvicorn
+    from orbit.app import create_app
 
-    print(f"ORBIT_READY: http://{settings.bind}:{settings.port} workspace={settings.workspace}",
+    if settings.bind not in {"127.0.0.1", "localhost", "::1"}:
+        print("ORBIT_BOOT_ERROR: ORBIT_BIND must be loopback-only", file=sys.stderr, flush=True)
+        return 2
+
+    print(f"ORBIT_STARTING: http://{settings.bind}:{settings.port} workspace={settings.workspace}",
           file=sys.stderr, flush=True)
-    uvicorn.run("orbit.app:app", host=settings.bind, port=settings.port,
+    # Import the app directly instead of relying on uvicorn string import inside
+    # PyInstaller's frozen __main__ runtime. Settings are not re-parsed on import.
+    app = create_app(settings)
+    uvicorn.run(app, host=settings.bind, port=settings.port,
                 reload=False, workers=1, log_level="info")
     return 0
 

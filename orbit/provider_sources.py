@@ -33,7 +33,7 @@ CLOUD = (
 REMOTE_HOSTS = frozenset(urlsplit(url).hostname for _, url in CLOUD)
 LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1"))
 MAX_PROVIDERS = 24
-MAX_MODELS_PER_SOURCE = 250
+MAX_MODELS_PER_SOURCE = 800
 
 
 class ProviderSetupError(ValueError):
@@ -189,10 +189,13 @@ class ProviderSources:
             return data
         headers = {"Authorization": "Bearer " + source["api_key"]} if source.get("api_key") else {}
         try:
+            timeout = 4.0 if source["category"] == "cloud" else 0.8
             reply = self.client.get(source["base_url"] + "/models",
-                                    headers=headers, timeout=0.8)
+                                    headers=headers, timeout=timeout)
             reply.raise_for_status()
             payload = reply.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid models response")
             entries = payload.get("data") or payload.get("models") or []
             if not isinstance(entries, list):
                 raise ValueError("invalid models response")
@@ -200,7 +203,7 @@ class ProviderSources:
                 model = entry.get("id") or entry.get("name") or entry.get("model") if isinstance(entry, dict) else entry
                 if isinstance(model, str) and 0 < len(model) < 180:
                     data["models"].append(model)
-        except (httpx.HTTPError, ValueError, TypeError):
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             # Ollama's canonical API exposes /api/tags. Its models may not be
             # loaded into VRAM; distinguish available model from actual generation.
             if source["category"] == "local" and source["base_url"].endswith("/v1"):

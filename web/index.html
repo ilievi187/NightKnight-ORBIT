@@ -16,7 +16,31 @@
       <div class="setup-steps"><span id="setupStageOne">01 · МОЗЪК</span><span>━━</span><span id="setupStageTwo">02 · АГЕНТИ</span><span>━━</span><span>03 · MISSION CONTROL</span></div>
       <h1 id="setupHeading">Избери мозъка на ORBIT</h1>
       <p id="setupSubtitle">Първо избираш модела, който мисли. След това избираш кого командва. Нищо не се стартира в GPU автоматично.</p>
-      <div id="setupBrainList" class="setup-options"><p class="setup-empty">Откриване на model API-та…</p></div>
+      <div class="brain-picker-tools" id="brainPickerTools">
+        <div class="brain-picker-tabs">
+          <button class="source-tab selected" type="button" data-source-filter="local">МОИТЕ ЛОКАЛНИ</button>
+          <button class="source-tab" type="button" data-source-filter="cloud">CLOUD / API</button>
+          <button class="source-tab" type="button" data-source-filter="all">ВСИЧКИ</button>
+        </div>
+        <div class="brain-picker-search">
+          <input id="setupModelSearch" type="search" placeholder="Търси модел или provider…" autocomplete="off" aria-label="Търси модел">
+          <button id="setupAddSource" class="ghost-btn" type="button">+ ДОБАВИ PROVIDER</button>
+        </div>
+      </div>
+      <form id="setupProviderForm" class="setup-provider-form" hidden>
+        <h2>Свържи модел API</h2>
+        <p>Локален сървър (llama.cpp, Ollama, LM Studio) или официален cloud OpenAI-compatible API.</p>
+        <label>Име <input id="providerName" required maxlength="70" placeholder="Напр. My LM Studio"></label>
+        <label>API адрес <input id="providerBaseUrl" required maxlength="320" placeholder="http://127.0.0.1:1234/v1"></label>
+        <label>API key <input id="providerApiKey" type="password" autocomplete="new-password" maxlength="1024" placeholder="Само ако provider изисква"></label>
+        <label>Model ID (по избор) <input id="providerModelHint" maxlength="120" placeholder="Напр. gpt-4.1 или local-model"></label>
+        <p class="provider-info">Ключовете остават само на твоя компютър във файл с права 0600; никога не се показват в списъка. ChatGPT Plus/Pro, Gemini и Claude абонаменти не осигуряват автоматично API достъп.</p>
+        <div class="setup-actions">
+          <button type="button" class="ghost-btn" id="providerCancel">ОТКАЖИ</button>
+          <button type="submit" class="setup-primary">ЗАПАЗИ И ПРОВЕРИ</button>
+        </div>
+      </form>
+      <div id="setupBrainList" class="setup-source-list"><p class="setup-empty">Откриване на model API-та…</p></div>
       <div id="setupTargetList" class="setup-options" hidden></div>
       <div class="setup-actions">
         <button id="setupRefresh" type="button" class="ghost-btn">↻ ОБНОВИ</button>

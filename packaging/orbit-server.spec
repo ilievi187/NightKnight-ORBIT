@@ -31,6 +31,7 @@ hiddenimports = collect_submodules('backports') + [
     'orbit.planmode',
     'orbit.mission_api',
     'orbit.brain_control',
+    'orbit.provider_sources',
     'uvicorn.logging',
     'uvicorn.loops.auto',
     'uvicorn.protocols.http.auto',

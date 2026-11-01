@@ -15,6 +15,7 @@ from .storage import Storage
 from .harness import Harness, PROFILES, ProviderError
 from .runtime import build_runtime, ProviderChatError
 from .brain_control import BrainControl, SetupError
+from .provider_sources import ProviderSetupError
 from .fleet import Fleet, FleetStore
 from .planmode import PlanStore, Supervisor
 from .mission_api import build_mission_router, create_worker_hooks, demo_root
@@ -71,6 +72,13 @@ class BrainChoice(BaseModel):
 
 class TargetChoice(BaseModel):
     worker_ids: list[str] = Field(default_factory=list, max_length=25)
+
+
+class ProviderInput(BaseModel):
+    name: str = Field(min_length=1, max_length=70)
+    base_url: str = Field(min_length=10, max_length=320)
+    api_key: str = Field(default="", max_length=1024)
+    model: str | None = Field(default=None, max_length=120)
 
 
 def create_app(settings: Settings | None = None, client: httpx.Client | None = None) -> FastAPI:
@@ -175,6 +183,25 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
         runtime = build_runtime(brain_runtime_config(), client=client)
         app.state.runtime = runtime
         return selection
+
+    @app.post("/api/setup/providers")
+    def add_model_provider(payload: ProviderInput):
+        """Configure a local/approved cloud OpenAI-compatible API. Keys stay private."""
+        try:
+            return brains.add_provider(payload.name, payload.base_url, payload.api_key, payload.model)
+        except ProviderSetupError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.delete("/api/setup/providers/{provider_id}")
+    def delete_model_provider(provider_id: str):
+        nonlocal runtime
+        try:
+            brains.remove_provider(provider_id)
+            runtime = build_runtime(brain_runtime_config(), client=client)
+            app.state.runtime = runtime
+        except ProviderSetupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"removed": True}
 
     @app.get("/api/setup/workers")
     def list_worker_targets():

@@ -5,6 +5,8 @@ const $ = id => document.getElementById(id);
 const descriptions = {ORBIT:'Selected brain and user-approved real workers'};
 let setupState = null;
 let setupStage = 'brain';
+let pickerFilter = 'local';
+let pickerCatalog = null;
 let activeSession = null;
 let activeProfile = 'ORBIT';
 let busy = false;
@@ -558,41 +560,153 @@ function renderSelectedBrain() {
     planets.append(dot);
   }
 }
+function setPickerFilter(value) {
+  pickerFilter = value;
+  document.querySelectorAll('[data-source-filter]').forEach(btn =>
+    btn.classList.toggle('selected', btn.dataset.sourceFilter === value));
+  if (pickerCatalog) renderBrainCatalog(pickerCatalog);
+}
+function setProviderForm(open, source = null) {
+  const form = $('setupProviderForm');
+  form.hidden = !open;
+  if (open) {
+    form.reset();
+    $('providerName').value = source?.name || '';
+    $('providerBaseUrl').value = source?.base_url || '';
+    form.scrollIntoView({block:'nearest',behavior:'smooth'});
+    $('providerName').focus();
+  }
+}
+async function submitProvider(event) {
+  event.preventDefault();
+  showSetupError('');
+  const form = $('setupProviderForm');
+  const button = form.querySelector('button[type=submit]');
+  button.disabled = true;
+  const record = {
+    name:$('providerName').value.trim(),
+    base_url:$('providerBaseUrl').value.trim(),
+    api_key:$('providerApiKey').value.trim(),
+    model:$('providerModelHint').value.trim() || null
+  };
+  try {
+    await api('/api/setup/providers', {method:'POST',body:JSON.stringify(record)});
+    $('providerApiKey').value = '';
+    setProviderForm(false);
+    await showBrainStep();
+  } catch (e) {
+    $('providerApiKey').value = '';
+    showSetupError('Provider не може да се добави: ' + e.message);
+  } finally {button.disabled = false;}
+}
+async function deleteProvider(source) {
+  if (!window.confirm('Премахване на '+source.name+' и локално запазения му API key?')) return;
+  try {
+    await api('/api/setup/providers/'+encodeURIComponent(source.id),{method:'DELETE'});
+    setupState = await api('/api/setup/status');
+    renderSelectedBrain();
+    await showBrainStep();
+  } catch (e) {showSetupError(e.message);}
+}
+function renderBrainCatalog(catalog) {
+  const target = $('setupBrainList'); target.replaceChildren();
+  const q = $('setupModelSearch').value.trim().toLowerCase();
+  let displayed = 0, skippedOffline = 0;
+  const brains = catalog.brains || [];
+  for (const source of catalog.sources || []) {
+    if (pickerFilter !== 'all' && source.category !== pickerFilter) continue;
+    const matches = brains.filter(b => b.source_id === source.id && b.online &&
+      (!q || (b.model+' '+source.name+' '+source.base_url).toLowerCase().includes(q)));
+    const matchedSource = !q || (source.name+' '+source.base_url).toLowerCase().includes(q);
+    if (q && !matches.length && !matchedSource) continue;
+    if (source.category === 'local' && source.status === 'offline' && source.origin === 'Discovery' && !q) {
+      skippedOffline++; continue;
+    }
+    displayed++;
+    const block = element('section','setup-provider-card');
+    const heading = element('div','setup-provider-heading');
+    const title = element('div','setup-provider-title');
+    title.append(element('strong','',source.name),
+                 element('code','',source.base_url));
+    const state = source.status === 'models_listed' ? 'API · '+source.models.length+' МОДЕЛА'
+      : source.status === 'needs_key' ? 'ИЗИСКВА API KEY' : 'OFFLINE / НЯМА МОДЕЛИ';
+    const status = element('span','setup-provider-state '+(source.status==='models_listed'?'online':''),state);
+    heading.append(title,status);
+    block.append(heading);
+    if (source.category === 'cloud' && source.status === 'needs_key') {
+      const connect = element('button','ghost-btn','СВЪРЖИ API KEY');
+      connect.type = 'button';
+      connect.addEventListener('click',()=>setProviderForm(true,source));
+      block.append(connect);
+    } else if (source.category === 'local' && source.status === 'offline') {
+      block.append(element('p','setup-offline-note','Стартирай model API на този порт или добави друг адрес.'));
+    } else if (source.status === 'offline') {
+      block.append(element('p','setup-offline-note','Няма достъпен модел. Провери API key, адреса и правата на акаунта.'));
+      const edit = element('button','ghost-btn','РЕДАКТИРАЙ API НАСТРОЙКИТЕ');
+      edit.type = 'button';edit.addEventListener('click',()=>setProviderForm(true,source));
+      block.append(edit);
+    }
+    const options = element('div','setup-model-options');
+    const listed = q && !matches.length ? [] : matches;
+    const buildModelButton = model => {
+      const select = element('button','setup-model-option');
+      select.type = 'button';
+      select.append(element('strong','',model.model),element('span','','ИЗБЕРИ МОЗЪК'));
+      select.addEventListener('click',async()=>{
+        select.disabled=true;
+        try {
+          setupState = await api('/api/setup/brain',{method:'POST',body:JSON.stringify({id:model.id})});
+          renderSelectedBrain();
+          await showWorkerStep();
+        } catch(e){showSetupError(e.message);}
+        finally{select.disabled=false;}
+      });
+      return select;
+    };
+    for (const model of (q ? listed : listed.slice(0,24)))
+      options.append(buildModelButton(model));
+    block.append(options);
+    if (!q && listed.length > 24) {
+      const more = element('button','ghost-btn','ПОКАЖИ ОЩЕ '+(listed.length-24)+' МОДЕЛА');
+      more.type='button';
+      more.addEventListener('click',()=>{
+        for (const model of listed.slice(24)) options.append(buildModelButton(model));
+        more.remove();
+      });
+      block.append(more);
+    }
+    if (source.origin === 'User-configured') {
+      const remove = element('button','setup-remove-provider','ПРЕМАХНИ PROVIDER');
+      remove.type='button';remove.addEventListener('click',()=>deleteProvider(source));
+      block.append(remove);
+    }
+    target.append(block);
+  }
+  if (!displayed) target.append(element('p','setup-empty',
+    q?'Няма съвпадения. Промени търсенето.':
+    pickerFilter==='local'?'Няма открит локален модел. Добави адрес на работещ llama.cpp / Ollama / LM Studio API.':
+    'Няма конфигурирани providers.'));
+  if (pickerFilter!=='cloud' && skippedOffline && !q)
+    target.append(element('p','setup-hint','Проверени са още '+skippedOffline+' локални порта без отговор.'));
+}
 async function showBrainStep() {
   setupStage = 'brain';
   $('setupHeading').textContent = '01 / Избери мозък';
-  $('setupSubtitle').textContent = 'Избери модел, който ще мисли и планира. Показваме действително отговарящи model API-та, без да зареждаме GPU автоматично.';
+  $('setupSubtitle').textContent = 'Локални модели + cloud API providers. ORBIT не стартира модели във VRAM. API списъкът не гарантира, че генерирането вече работи.';
   $('setupStageOne').classList.add('current');
   $('setupStageTwo').classList.remove('current');
   $('setupBrainList').hidden = false;
+  $('brainPickerTools').hidden = false;
   $('setupTargetList').hidden = true;
   $('setupContinue').hidden = true;
   $('setupBack').hidden = true;
   showSetupError('');
   const target = $('setupBrainList');
-  target.replaceChildren(element('p', 'setup-empty', 'Откривам локалните model API-та…'));
+  target.replaceChildren(element('p','setup-empty','Проверявам локални и конфигурирани cloud APIs…'));
   try {
-    const result = await api('/api/setup/brains');
-    target.replaceChildren();
-    if (!result.brains?.length) target.append(element('p','setup-empty',
-      'Няма намерен модел. Стартирай model API и натисни ОБНОВИ.'));
-    for (const brain of result.brains || []) {
-      const btn = element('button', 'setup-option');
-      btn.type = 'button';
-      btn.disabled = !brain.online;
-      btn.append(element('strong','',brain.model),element('code','',brain.base_url),
-                 element('small','',brain.online ? 'API ONLINE · ИЗБЕРИ' : 'OFFLINE / НЕПОТВЪРДЕН'));
-      if (brain.online) btn.addEventListener('click', async () => {
-        try {
-          setupState = await api('/api/setup/brain',
-            {method:'POST',body:JSON.stringify({id:brain.id})});
-          renderSelectedBrain();
-          await showWorkerStep();
-        } catch (e) { showSetupError(e.message); }
-      });
-      target.append(btn);
-    }
-  } catch (e) { showSetupError('Грешка при проверка на моделите: ' + e.message); }
+    pickerCatalog = await api('/api/setup/brains');
+    renderBrainCatalog(pickerCatalog);
+  } catch(e){showSetupError('Грешка при проверка на моделите: '+e.message);}
 }
 async function showWorkerStep() {
   if (!setupState?.brain) return showBrainStep();
@@ -602,6 +716,8 @@ async function showWorkerStep() {
   $('setupStageOne').classList.remove('current');
   $('setupStageTwo').classList.add('current');
   $('setupBrainList').hidden = true;
+  $('brainPickerTools').hidden = true;
+  setProviderForm(false);
   $('setupTargetList').hidden = false;
   $('setupContinue').hidden = false;
   $('setupBack').hidden = false;
@@ -662,6 +778,12 @@ async function boot() {
   $('setupRefresh').addEventListener('click', () => (setupStage === 'brain' ? showBrainStep() : showWorkerStep()));
   $('setupBack').addEventListener('click', showBrainStep);
   $('setupContinue').addEventListener('click', saveTargetSelection);
+  document.querySelectorAll('[data-source-filter]').forEach(btn =>
+    btn.addEventListener('click',()=>setPickerFilter(btn.dataset.sourceFilter)));
+  $('setupModelSearch').addEventListener('input',()=>pickerCatalog&&renderBrainCatalog(pickerCatalog));
+  $('setupAddSource').addEventListener('click',()=>setProviderForm(true));
+  $('providerCancel').addEventListener('click',()=>setProviderForm(false));
+  $('setupProviderForm').addEventListener('submit',submitProvider);
 
   // MISSIONS
   $('launchDemoMission').addEventListener('click', () => launchDemoMission().catch(err => banner(err.message, 'missionBanner')));

@@ -679,7 +679,9 @@ async function boot() {
   try { await loadSessions(); }
   catch (e) { banner('Backend не отговаря: ' + e.message); }
   await refreshSummary().catch(() => {});
-  await openSetup().catch(e => showSetupError(e.message));
+  // Explicitly confirm brain then targets on EVERY desktop launch.
+  // Remembered choices never silently authorize a previous agent fleet.
+  await openSetup('brain').catch(e => showSetupError(e.message));
   startClock();
 }
 window.addEventListener('DOMContentLoaded', boot);

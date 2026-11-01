@@ -13,6 +13,7 @@ from .config import Settings
 from .storage import Storage
 from .harness import Harness, PROFILES, ProviderError
 from .runtime import build_runtime, ProviderChatError
+from .brain_control import BrainControl, SetupError
 from .fleet import Fleet, FleetStore
 from .planmode import PlanStore, Supervisor
 from .mission_api import build_mission_router, create_worker_hooks, demo_root
@@ -63,6 +64,14 @@ class BenchmarkRequest(BaseModel):
     max_tokens: int = Field(default=32, ge=1, le=512)
 
 
+class BrainChoice(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+
+
+class TargetChoice(BaseModel):
+    worker_ids: list[str] = Field(default_factory=list, max_length=25)
+
+
 def create_app(settings: Settings | None = None, client: httpx.Client | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
     store = Storage(settings.database)
@@ -79,6 +88,10 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     supervisor = Supervisor(plan_store, default_root=settings.workspace, fleet=fleet_registry)
     app.state.missions = supervisor
     app.state.fleet = fleet_registry
+    brains = BrainControl(settings, fleet_registry, client=client)
+    engine.brain_route = brains.chat_route
+    supervisor.command_targets = brains
+    app.state.brains = brains
     missions_enabled = os.getenv("ORBIT_MISSIONS", "1") != "0"
     if missions_enabled:
         app.include_router(build_mission_router(
@@ -113,7 +126,8 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     @app.get("/api/health")
     def health():
         diag = runtime.status()  # cached snapshot only, no network activity
-        return {"status": "ok", "version": "0.1.0", "provider_status": diag.get("selected_status") or "not_checked",
+        setup = brains.status()
+        return {"status": "ok", "version": "0.1.0", "setup": setup, "provider_status": diag.get("selected_status") or "not_checked",
                 "model": settings.model, "base_url": settings.base_url, "workspace": str(settings.workspace),
                 "write_policy": "human_approval", "runtime": {
                     "probed_provider": diag.get("selected"),
@@ -128,6 +142,32 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
                     "provider_count": diag.get("provider_count"),
                     "note": "Probe metadata only; ORBIT chat still uses configured Harness provider.",
                 }}
+
+    @app.get("/api/setup/status")
+    def setup_status():
+        return brains.status()
+
+    @app.get("/api/setup/brains")
+    def list_brains():
+        return brains.catalog()
+
+    @app.post("/api/setup/brain")
+    def set_brain(payload: BrainChoice):
+        try:
+            return brains.select(payload.id)
+        except SetupError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/setup/workers")
+    def list_worker_targets():
+        return brains.workers()
+
+    @app.post("/api/setup/workers")
+    def set_worker_targets(payload: TargetChoice):
+        try:
+            return brains.select_workers(payload.worker_ids)
+        except SetupError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/agents")
     def agents():

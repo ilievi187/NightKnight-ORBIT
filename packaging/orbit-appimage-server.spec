@@ -11,7 +11,7 @@ if (ROOT / "web").is_dir():
 hiddenimports = collect_submodules('backports') + [
     'backports', 'backports.tarfile',
     "orbit.app", "orbit.config", "orbit.harness", "orbit.storage",
-    "orbit.fleet", "orbit.planmode", "orbit.mission_api",
+    "orbit.fleet", "orbit.planmode", "orbit.mission_api", "orbit.brain_control",
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
     "httptools", "uvloop", "websockets", "h11",

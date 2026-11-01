@@ -403,7 +403,13 @@ class Supervisor:
     def eligible_workers(self, now: float) -> list[dict]:
         if not self.fleet:
             return []
-        return list(self.fleet.capable_workers(self.capability_name(), now=now))
+        eligible = list(self.fleet.capable_workers(self.capability_name(), now=now))
+        policy = getattr(self, "command_targets", None)
+        if policy is not None:
+            allowed = policy.allowed_workers(now)
+            if allowed is not None:
+                eligible = [w for w in eligible if (w.get("worker_id") or w.get("id")) in allowed]
+        return eligible
 
     def blocked_reason(self, spec: dict, grant: MissionGrant) -> str | None:
         path = str(spec.get("path") or "")

@@ -88,6 +88,7 @@ def create_app(settings: Settings | None = None, client: httpx.Client | None = N
     app.state.missions = supervisor
     app.state.fleet = fleet_registry
     brains = BrainControl(settings, fleet_registry, client=client)
+    brains.reset_worker_authority()  # Never silently authorize yesterday's worker fleet.
     engine.brain_route = brains.chat_route
     supervisor.command_targets = brains
     app.state.brains = brains

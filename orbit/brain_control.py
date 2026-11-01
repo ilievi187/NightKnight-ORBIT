@@ -60,6 +60,11 @@ class BrainControl:
             "targets_confirmed": bool(confirmed),
         }
 
+    def reset_worker_authority(self) -> None:
+        """On every backend start, require an explicit new worker permission."""
+        with self.connect() as db:
+            db.execute("UPDATE orbit_setup SET selected_workers='[]', confirmed=0 WHERE slot=1")
+
     @staticmethod
     def _key(base_url: str, model: str) -> str:
         return hashlib.sha256((base_url + "\0" + model).encode()).hexdigest()[:24]

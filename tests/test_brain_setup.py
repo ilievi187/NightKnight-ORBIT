@@ -121,6 +121,17 @@ class BrainFirstTests(unittest.TestCase):
             self.assertEqual(chats[-1].url.port,18879)
             self.assertEqual(json.loads(chats[-1].content)["model"],"heretic27-fastlink-65k")
 
+    def test_backend_restart_requires_reconfirming_worker_permissions(self):
+        self.choose_heretic()
+        self.brains.select_workers([])
+        self.assertTrue(self.brains.status()["targets_confirmed"])
+        app = create_app(self.settings, self.http)
+        with TestClient(app) as client:
+            state = client.get("/api/setup/status").json()
+            self.assertFalse(state["targets_confirmed"])
+            self.assertEqual(state["worker_ids"], [])
+            self.assertEqual(state["brain"]["model"], "heretic27-fastlink-65k")
+
     def test_no_hardcoded_agents_in_first_run_ui(self):
         html = (Path(__file__).resolve().parents[1]/"web"/"index.html").read_text()
         self.assertIn('id="setupScreen"',html)

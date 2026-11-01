@@ -23,3 +23,9 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Bytecode syntax check
         run: python -m compileall -q orbit tests
+      - name: Check first-run browser JavaScript syntax
+        run: |
+          node --check web/app.js
+          grep -q 'id="setupScreen"' web/index.html
+          grep -q 'id="setupBrainList"' web/index.html
+          grep -q 'id="setupTargetList"' web/index.html

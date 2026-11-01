@@ -8,6 +8,7 @@ from .storage import Storage
 from .tools import TOOLS, WRITE_TOOLS, execute_tool
 
 PROFILES = {
+    "ORBIT": "You are the selected ORBIT supervisor brain. Be precise about which workers are actually connected, and never fabricate execution.",
     "ALEX": "You are ALEX, a capable and precise coding and system engineering agent. Work incrementally; confirm evidence before claiming success.",
     "NOVA": "You are NOVA, a creative but rigorous planning, research and architecture agent. Explain tradeoffs and avoid confident guesses.",
     "HERMES": "You are HERMES, a pragmatic local coding agent. Minimize waste, favor concise execution plans and verify file operations.",
@@ -27,6 +28,7 @@ class Harness:
         self.client = client or httpx.Client(timeout=httpx.Timeout(90, connect=8))
         self._locks_guard = threading.Lock()
         self._locks = {}
+        self.brain_route = None  # Optional callable selected by first-run setup
 
     def lock(self, session_id: str):
         with self._locks_guard:
@@ -60,10 +62,12 @@ class Harness:
 
     def _completion(self, session_id):
         headers = {"Content-Type": "application/json"}
-        if self.settings.api_key:
-            headers["Authorization"] = f"Bearer {self.settings.api_key}"
+        base_url, model, api_key = (self.brain_route() if self.brain_route else
+                                    (self.settings.base_url, self.settings.model, self.settings.api_key))
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         payload = {
-            "model": self.settings.model,
+            "model": model,
             "messages": self._model_messages(session_id),
             "tools": TOOLS,
             "tool_choice": "auto",
@@ -71,7 +75,7 @@ class Harness:
             "stream": False,
         }
         try:
-            response = self.client.post(self.settings.base_url + "/chat/completions", headers=headers, json=payload)
+            response = self.client.post(base_url + "/chat/completions", headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]
